@@ -1,0 +1,3 @@
+[submodule "crates/flashmla-sys/vendor/FlashMLA"]
+	path = crates/flashmla-sys/vendor/FlashMLA
+	url = https://github.com/deepseek-ai/FlashMLA.git

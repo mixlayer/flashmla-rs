@@ -1,0 +1,8 @@
+[package]
+name = "flashmla-sys"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+links = "flashmla"
+
+[dependencies]

@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/flashmla-sys",
+    "crates/flashmla",
+    "crates/candle-flashmla",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+flashmla-sys = { path = "crates/flashmla-sys" }
+flashmla = { path = "crates/flashmla" }
