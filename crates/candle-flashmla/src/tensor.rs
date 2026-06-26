@@ -23,7 +23,6 @@ pub fn ensure_same_shape(left: &[usize], right: &[usize]) -> Result<()> {
     }
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) mod cuda {
     use std::{ffi::c_void, sync::Arc};
 

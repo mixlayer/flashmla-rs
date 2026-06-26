@@ -2,15 +2,12 @@
 
 pub use flashmla::{SparseDecodeConfig, SparseDecodeDims, SparseDecodePlanMeta};
 
-#[cfg(feature = "cuda")]
 use candle::{DType, Tensor};
-#[cfg(feature = "cuda")]
 use flashmla::{
     SparseDecodeLaunchParams, SparseDecodePlanParams, SparseDecodeStrides, get_device_info,
     sparse_decode_bf16_fp8, sparse_decode_plan as flashmla_sparse_decode_plan,
 };
 
-#[cfg(feature = "cuda")]
 use crate::{
     Result,
     error::invalid_arg,
@@ -21,7 +18,6 @@ use crate::{
 };
 
 /// Caller-owned sparse decode scheduler and split-KV workspaces.
-#[cfg(feature = "cuda")]
 #[derive(Debug)]
 pub struct SparseDecodePlan {
     /// I32 scheduler metadata shaped `[num_sm_parts, metadata_i32_per_part]`.
@@ -37,7 +33,6 @@ pub struct SparseDecodePlan {
 }
 
 /// Output tensors returned by sparse decode.
-#[cfg(feature = "cuda")]
 #[derive(Debug)]
 pub struct SparseDecodeOutput {
     /// BF16 attention output shaped `[batch, s_q, h_q, d_v]`.
@@ -47,7 +42,6 @@ pub struct SparseDecodeOutput {
 }
 
 /// Allocates sparse decode scheduler metadata and split-KV workspaces.
-#[cfg(feature = "cuda")]
 pub fn sparse_decode_plan(
     q: &Tensor,
     kv_cache: &Tensor,
@@ -204,7 +198,6 @@ pub fn sparse_decode_plan(
 }
 
 /// Launches FlashMLA sparse decode on Candle CUDA tensors.
-#[cfg(feature = "cuda")]
 pub fn sparse_decode(
     q: &Tensor,
     kv_cache: &Tensor,
@@ -432,7 +425,6 @@ pub fn sparse_decode(
     })
 }
 
-#[cfg(feature = "cuda")]
 fn validate_decode_tensors(
     q: &Tensor,
     kv_cache: &Tensor,
@@ -532,7 +524,6 @@ fn validate_decode_tensors(
     Ok(dims)
 }
 
-#[cfg(feature = "cuda")]
 fn validate_extra_tensors(
     q: &Tensor,
     kv_cache: &Tensor,
@@ -609,7 +600,6 @@ fn validate_extra_tensors(
     }
 }
 
-#[cfg(feature = "cuda")]
 fn validate_plan_tensors(
     q: &Tensor,
     dims: SparseDecodeDims,
@@ -658,7 +648,6 @@ fn validate_plan_tensors(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
 fn ensure_kv_cache_dtype(t: &Tensor, name: &str) -> Result<()> {
     match t.dtype() {
         DType::U8 | DType::F8E4M3 => Ok(()),
@@ -668,13 +657,14 @@ fn ensure_kv_cache_dtype(t: &Tensor, name: &str) -> Result<()> {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use candle::{DType, Device, Tensor};
 
     use super::*;
 
     #[test]
+    #[ignore = "requires a visible SM90 CUDA GPU"]
     fn sparse_decode_sm90_smoke() -> Result<()> {
         let device = Device::new_cuda(0)?;
         let q = Tensor::zeros((1, 1, 64, 576), DType::BF16, &device)?;

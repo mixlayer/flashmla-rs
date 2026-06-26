@@ -14,7 +14,5 @@ pub mod workspace;
 /// Candle integration error and result types.
 pub use error::{Error, Result};
 
-#[cfg(feature = "cuda")]
 pub use sparse_decode::{SparseDecodeOutput, SparseDecodePlan, sparse_decode, sparse_decode_plan};
-#[cfg(feature = "cuda")]
 pub use sparse_prefill::{SparsePrefillOutput, sparse_prefill};

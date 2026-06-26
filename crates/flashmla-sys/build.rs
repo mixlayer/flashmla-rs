@@ -219,7 +219,9 @@ fn parse_arch(value: &str, source: &str) -> Arch {
     match normalized.as_str() {
         "90" | "90a" | "sm90" | "sm90a" | "compute90a" => Arch::Sm90a,
         "100" | "100f" | "sm100" | "sm100f" | "compute100f" => {
-            panic!("{source}={value:?} requested SM100, but Phase 2 only wires SM90 sources")
+            panic!(
+                "{source}={value:?} requested SM100, but bindings not implemented by this crate yet"
+            )
         }
         "120" | "121" | "sm120" | "sm121" => {
             panic!("{source}={value:?} is unsupported by upstream FlashMLA sparse MLA")

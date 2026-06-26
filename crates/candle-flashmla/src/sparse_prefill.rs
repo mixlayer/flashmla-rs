@@ -2,12 +2,9 @@
 
 pub use flashmla::{SparsePrefillConfig, SparsePrefillDims, SparsePrefillStrides};
 
-#[cfg(feature = "cuda")]
 use candle::{DType, Tensor};
-#[cfg(feature = "cuda")]
 use flashmla::{SparsePrefillLaunchParams, get_device_info, sparse_prefill_bf16};
 
-#[cfg(feature = "cuda")]
 use crate::{
     Result,
     error::invalid_arg,
@@ -18,7 +15,6 @@ use crate::{
 };
 
 /// Output tensors returned by sparse prefill.
-#[cfg(feature = "cuda")]
 #[derive(Debug)]
 pub struct SparsePrefillOutput {
     /// BF16 attention output shaped `[s_q, h_q, d_v]`.
@@ -30,7 +26,6 @@ pub struct SparsePrefillOutput {
 }
 
 /// Launches FlashMLA sparse prefill on Candle CUDA tensors.
-#[cfg(feature = "cuda")]
 pub fn sparse_prefill(
     q: &Tensor,
     kv: &Tensor,
@@ -192,13 +187,14 @@ pub fn sparse_prefill(
     })
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use candle::{DType, Device, Tensor};
 
     use super::*;
 
     #[test]
+    #[ignore = "requires a visible SM90 CUDA GPU"]
     fn sparse_prefill_sm90_smoke() -> Result<()> {
         let device = Device::new_cuda(0)?;
         let q = Tensor::zeros((16, 64, 512), DType::BF16, &device)?;
