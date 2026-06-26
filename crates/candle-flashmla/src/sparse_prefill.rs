@@ -13,8 +13,7 @@ use crate::{
     error::invalid_arg,
     tensor::cuda::{
         ensure_dtype, ensure_last_dim_contiguous, ensure_rank, ensure_same_device,
-        stream_and_device_id, tensor_mut_ptr_bf16, tensor_mut_ptr_f32, tensor_ptr_bf16,
-        tensor_ptr_f32, tensor_ptr_i32,
+        stream_and_device_id, tensor_ptr_bf16, tensor_ptr_f32, tensor_ptr_i32,
     },
 };
 
@@ -118,30 +117,73 @@ pub fn sparse_prefill(
         indices_h_kv: indices_stride[1],
     };
 
-    let params = SparsePrefillLaunchParams {
-        dims,
-        config,
-        q: tensor_ptr_bf16(q, &stream, "q")?,
-        kv: tensor_ptr_bf16(kv, &stream, "kv")?,
-        indices: tensor_ptr_i32(indices, &stream, "indices")?,
-        attn_sink: match attn_sink {
-            Some(attn_sink) => tensor_ptr_f32(attn_sink, &stream, "attn_sink")?,
-            None => std::ptr::null(),
-        },
-        topk_length: match topk_length {
-            Some(topk_length) => tensor_ptr_i32(topk_length, &stream, "topk_length")?,
-            None => std::ptr::null(),
-        },
-        strides,
-        out: tensor_mut_ptr_bf16(&out, &stream, "out")?,
-        max_logits: tensor_mut_ptr_f32(&max_logits, &stream, "max_logits")?,
-        lse: tensor_mut_ptr_f32(&lse, &stream, "lse")?,
-        num_sm: usize::try_from(device.num_sms)
-            .map_err(|_| crate::Error::Tensor("num_sms overflow".to_string()))?,
-        stream: stream.cu_stream() as *mut std::ffi::c_void,
-    };
+    {
+        let (q_storage, q_layout) = q.storage_and_layout();
+        let (kv_storage, kv_layout) = kv.storage_and_layout();
+        let (indices_storage, indices_layout) = indices.storage_and_layout();
+        let attn_sink_storage_and_layout = attn_sink.map(Tensor::storage_and_layout);
+        let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
+        let (out_storage, out_layout) = out.storage_and_layout();
+        let (max_logits_storage, max_logits_layout) = max_logits.storage_and_layout();
+        let (lse_storage, lse_layout) = lse.storage_and_layout();
+        let q_ptr = tensor_ptr_bf16(&q_storage, q_layout.start_offset(), &stream, "q")?;
+        let kv_ptr = tensor_ptr_bf16(&kv_storage, kv_layout.start_offset(), &stream, "kv")?;
+        let indices_ptr = tensor_ptr_i32(
+            &indices_storage,
+            indices_layout.start_offset(),
+            &stream,
+            "indices",
+        )?;
+        let attn_sink_ptr = match &attn_sink_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_f32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "attn_sink",
+            )?),
+            None => None,
+        };
+        let topk_length_ptr = match &topk_length_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "topk_length",
+            )?),
+            None => None,
+        };
+        let out_ptr = tensor_ptr_bf16(&out_storage, out_layout.start_offset(), &stream, "out")?;
+        let max_logits_ptr = tensor_ptr_f32(
+            &max_logits_storage,
+            max_logits_layout.start_offset(),
+            &stream,
+            "max_logits",
+        )?;
+        let lse_ptr = tensor_ptr_f32(&lse_storage, lse_layout.start_offset(), &stream, "lse")?;
 
-    unsafe { sparse_prefill_bf16(&params)? };
+        let params = SparsePrefillLaunchParams {
+            dims,
+            config,
+            q: q_ptr.as_const_void(),
+            kv: kv_ptr.as_const_void(),
+            indices: indices_ptr.as_const_i32(),
+            attn_sink: attn_sink_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_f32()),
+            topk_length: topk_length_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            strides,
+            out: out_ptr.as_mut_void(),
+            max_logits: max_logits_ptr.as_mut_f32(),
+            lse: lse_ptr.as_mut_f32(),
+            num_sm: usize::try_from(device.num_sms)
+                .map_err(|_| crate::Error::Tensor("num_sms overflow".to_string()))?,
+            stream: stream.cu_stream() as *mut std::ffi::c_void,
+        };
+
+        unsafe { sparse_prefill_bf16(&params)? };
+    }
 
     Ok(SparsePrefillOutput {
         out,

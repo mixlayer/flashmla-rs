@@ -16,8 +16,7 @@ use crate::{
     error::invalid_arg,
     tensor::cuda::{
         ensure_dtype, ensure_last_dim_contiguous, ensure_rank, ensure_same_device,
-        stream_and_device_id, tensor_mut_ptr_bf16, tensor_mut_ptr_f32, tensor_mut_ptr_i32,
-        tensor_ptr_bf16, tensor_ptr_f32, tensor_ptr_i32, tensor_ptr_u8_or_f8,
+        stream_and_device_id, tensor_ptr_bf16, tensor_ptr_f32, tensor_ptr_i32, tensor_ptr_u8_or_f8,
     },
 };
 
@@ -75,25 +74,44 @@ pub fn sparse_decode_plan(
     let num_sm = usize::try_from(device.num_sms)
         .map_err(|_| crate::Error::Tensor("num_sms overflow".to_string()))?;
 
-    let topk_length_ptr = match topk_length {
-        Some(topk_length) => tensor_ptr_i32(topk_length, &stream, "topk_length")?,
-        None => std::ptr::null(),
-    };
-    let extra_topk_length_ptr = match extra_topk_length {
-        Some(extra_topk_length) => tensor_ptr_i32(extra_topk_length, &stream, "extra_topk_length")?,
-        None => std::ptr::null(),
-    };
+    let meta = {
+        let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
+        let extra_topk_length_storage_and_layout =
+            extra_topk_length.map(Tensor::storage_and_layout);
+        let topk_length_ptr = match &topk_length_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "topk_length",
+            )?),
+            None => None,
+        };
+        let extra_topk_length_ptr = match &extra_topk_length_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "extra_topk_length",
+            )?),
+            None => None,
+        };
 
-    let plan_params = SparseDecodePlanParams {
-        dims,
-        topk_length: topk_length_ptr,
-        extra_topk_length: extra_topk_length_ptr,
-        tile_scheduler_metadata: std::ptr::null_mut(),
-        num_splits: std::ptr::null_mut(),
-        num_sm,
-        stream: stream.cu_stream() as *mut std::ffi::c_void,
+        let plan_params = SparseDecodePlanParams {
+            dims,
+            topk_length: topk_length_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            extra_topk_length: extra_topk_length_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            tile_scheduler_metadata: std::ptr::null_mut(),
+            num_splits: std::ptr::null_mut(),
+            num_sm,
+            stream: stream.cu_stream() as *mut std::ffi::c_void,
+        };
+        unsafe { flashmla_sparse_decode_plan(&plan_params)? }
     };
-    let meta = unsafe { flashmla_sparse_decode_plan(&plan_params)? };
 
     if meta.num_sm_parts == 0 || meta.scheduler_metadata_i32_len % meta.num_sm_parts != 0 {
         return invalid_arg("invalid sparse decode scheduler metadata shape");
@@ -118,20 +136,62 @@ pub fn sparse_decode_plan(
         q.device(),
     )?;
 
-    let plan_params = SparseDecodePlanParams {
-        tile_scheduler_metadata: tensor_mut_ptr_i32(
-            &scheduler_metadata,
+    {
+        let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
+        let extra_topk_length_storage_and_layout =
+            extra_topk_length.map(Tensor::storage_and_layout);
+        let topk_length_ptr = match &topk_length_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "topk_length",
+            )?),
+            None => None,
+        };
+        let extra_topk_length_ptr = match &extra_topk_length_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "extra_topk_length",
+            )?),
+            None => None,
+        };
+        let (scheduler_metadata_storage, scheduler_metadata_layout) =
+            scheduler_metadata.storage_and_layout();
+        let (num_splits_storage, num_splits_layout) = num_splits.storage_and_layout();
+        let scheduler_metadata_ptr = tensor_ptr_i32(
+            &scheduler_metadata_storage,
+            scheduler_metadata_layout.start_offset(),
             &stream,
             "scheduler_metadata",
-        )?,
-        num_splits: tensor_mut_ptr_i32(&num_splits, &stream, "num_splits")?,
-        ..plan_params
-    };
-    let generated_meta = unsafe { flashmla_sparse_decode_plan(&plan_params)? };
-    if generated_meta != meta {
-        return invalid_arg(
-            "sparse decode metadata generation returned inconsistent plan metadata",
-        );
+        )?;
+        let num_splits_ptr = tensor_ptr_i32(
+            &num_splits_storage,
+            num_splits_layout.start_offset(),
+            &stream,
+            "num_splits",
+        )?;
+        let plan_params = SparseDecodePlanParams {
+            dims,
+            topk_length: topk_length_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            extra_topk_length: extra_topk_length_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            tile_scheduler_metadata: scheduler_metadata_ptr.as_mut_i32(),
+            num_splits: num_splits_ptr.as_mut_i32(),
+            num_sm,
+            stream: stream.cu_stream() as *mut std::ffi::c_void,
+        };
+        let generated_meta = unsafe { flashmla_sparse_decode_plan(&plan_params)? };
+        if generated_meta != meta {
+            return invalid_arg(
+                "sparse decode metadata generation returned inconsistent plan metadata",
+            );
+        }
     }
 
     Ok(SparseDecodePlan {
@@ -224,50 +284,147 @@ pub fn sparse_decode(
         o_accum_h_q: o_accum_stride[2],
     };
 
-    let params = SparseDecodeLaunchParams {
-        dims,
-        config,
-        q: tensor_ptr_bf16(q, &stream, "q")?,
-        kv: tensor_ptr_u8_or_f8(kv_cache, &stream, "kv_cache")?,
-        indices: tensor_ptr_i32(indices, &stream, "indices")?,
-        topk_length: match topk_length {
-            Some(topk_length) => tensor_ptr_i32(topk_length, &stream, "topk_length")?,
-            None => std::ptr::null(),
-        },
-        attn_sink: match attn_sink {
-            Some(attn_sink) => tensor_ptr_f32(attn_sink, &stream, "attn_sink")?,
-            None => std::ptr::null(),
-        },
-        out: tensor_mut_ptr_bf16(&out, &stream, "out")?,
-        lse: tensor_mut_ptr_f32(&lse_internal, &stream, "lse")?,
-        extra_kv: match extra_kv_cache {
-            Some(extra_kv_cache) => tensor_ptr_u8_or_f8(extra_kv_cache, &stream, "extra_kv_cache")?,
-            None => std::ptr::null(),
-        },
-        extra_indices: match extra_indices {
-            Some(extra_indices) => tensor_ptr_i32(extra_indices, &stream, "extra_indices")?,
-            None => std::ptr::null(),
-        },
-        extra_topk_length: match extra_topk_length {
-            Some(extra_topk_length) => {
-                tensor_ptr_i32(extra_topk_length, &stream, "extra_topk_length")?
-            }
-            None => std::ptr::null(),
-        },
-        strides,
-        lse_accum: tensor_mut_ptr_f32(&plan.lse_accum, &stream, "lse_accum")?,
-        o_accum: tensor_mut_ptr_f32(&plan.o_accum, &stream, "o_accum")?,
-        tile_scheduler_metadata: tensor_mut_ptr_i32(
-            &plan.scheduler_metadata,
+    {
+        let (q_storage, q_layout) = q.storage_and_layout();
+        let (kv_cache_storage, kv_cache_layout) = kv_cache.storage_and_layout();
+        let (indices_storage, indices_layout) = indices.storage_and_layout();
+        let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
+        let attn_sink_storage_and_layout = attn_sink.map(Tensor::storage_and_layout);
+        let (out_storage, out_layout) = out.storage_and_layout();
+        let (lse_storage, lse_layout) = lse_internal.storage_and_layout();
+        let extra_kv_cache_storage_and_layout = extra_kv_cache.map(Tensor::storage_and_layout);
+        let extra_indices_storage_and_layout = extra_indices.map(Tensor::storage_and_layout);
+        let extra_topk_length_storage_and_layout =
+            extra_topk_length.map(Tensor::storage_and_layout);
+        let (lse_accum_storage, lse_accum_layout) = plan.lse_accum.storage_and_layout();
+        let (o_accum_storage, o_accum_layout) = plan.o_accum.storage_and_layout();
+        let (scheduler_metadata_storage, scheduler_metadata_layout) =
+            plan.scheduler_metadata.storage_and_layout();
+        let (num_splits_storage, num_splits_layout) = plan.num_splits.storage_and_layout();
+
+        let q_ptr = tensor_ptr_bf16(&q_storage, q_layout.start_offset(), &stream, "q")?;
+        let kv_ptr = tensor_ptr_u8_or_f8(
+            &kv_cache_storage,
+            kv_cache.dtype(),
+            kv_cache_layout.start_offset(),
+            &stream,
+            "kv_cache",
+        )?;
+        let indices_ptr = tensor_ptr_i32(
+            &indices_storage,
+            indices_layout.start_offset(),
+            &stream,
+            "indices",
+        )?;
+        let topk_length_ptr = match &topk_length_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "topk_length",
+            )?),
+            None => None,
+        };
+        let attn_sink_ptr = match &attn_sink_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_f32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "attn_sink",
+            )?),
+            None => None,
+        };
+        let out_ptr = tensor_ptr_bf16(&out_storage, out_layout.start_offset(), &stream, "out")?;
+        let lse_ptr = tensor_ptr_f32(&lse_storage, lse_layout.start_offset(), &stream, "lse")?;
+        let extra_kv_ptr = match &extra_kv_cache_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_u8_or_f8(
+                storage,
+                extra_kv_cache
+                    .expect("extra_kv_cache storage exists only when tensor exists")
+                    .dtype(),
+                layout.start_offset(),
+                &stream,
+                "extra_kv_cache",
+            )?),
+            None => None,
+        };
+        let extra_indices_ptr = match &extra_indices_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "extra_indices",
+            )?),
+            None => None,
+        };
+        let extra_topk_length_ptr = match &extra_topk_length_storage_and_layout {
+            Some((storage, layout)) => Some(tensor_ptr_i32(
+                storage,
+                layout.start_offset(),
+                &stream,
+                "extra_topk_length",
+            )?),
+            None => None,
+        };
+        let lse_accum_ptr = tensor_ptr_f32(
+            &lse_accum_storage,
+            lse_accum_layout.start_offset(),
+            &stream,
+            "lse_accum",
+        )?;
+        let o_accum_ptr = tensor_ptr_f32(
+            &o_accum_storage,
+            o_accum_layout.start_offset(),
+            &stream,
+            "o_accum",
+        )?;
+        let scheduler_metadata_ptr = tensor_ptr_i32(
+            &scheduler_metadata_storage,
+            scheduler_metadata_layout.start_offset(),
             &stream,
             "scheduler_metadata",
-        )?,
-        num_splits: tensor_mut_ptr_i32(&plan.num_splits, &stream, "num_splits")?,
-        num_sm_parts: plan.meta.num_sm_parts,
-        stream: stream.cu_stream() as *mut std::ffi::c_void,
-    };
+        )?;
+        let num_splits_ptr = tensor_ptr_i32(
+            &num_splits_storage,
+            num_splits_layout.start_offset(),
+            &stream,
+            "num_splits",
+        )?;
 
-    unsafe { sparse_decode_bf16_fp8(&params)? };
+        let params = SparseDecodeLaunchParams {
+            dims,
+            config,
+            q: q_ptr.as_const_void(),
+            kv: kv_ptr.as_const_void(),
+            indices: indices_ptr.as_const_i32(),
+            topk_length: topk_length_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            attn_sink: attn_sink_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_f32()),
+            out: out_ptr.as_mut_void(),
+            lse: lse_ptr.as_mut_f32(),
+            extra_kv: extra_kv_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_void()),
+            extra_indices: extra_indices_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            extra_topk_length: extra_topk_length_ptr
+                .as_ref()
+                .map_or(std::ptr::null(), |ptr| ptr.as_const_i32()),
+            strides,
+            lse_accum: lse_accum_ptr.as_mut_f32(),
+            o_accum: o_accum_ptr.as_mut_f32(),
+            tile_scheduler_metadata: scheduler_metadata_ptr.as_mut_i32(),
+            num_splits: num_splits_ptr.as_mut_i32(),
+            num_sm_parts: plan.meta.num_sm_parts,
+            stream: stream.cu_stream() as *mut std::ffi::c_void,
+        };
+
+        unsafe { sparse_decode_bf16_fp8(&params)? };
+    }
 
     Ok(SparseDecodeOutput {
         out,
