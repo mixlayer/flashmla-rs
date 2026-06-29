@@ -18,6 +18,7 @@ const UPSTREAM_SM90_SOURCES: &[&str] = &[
     "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
     "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
     "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+    "csrc/sm90/decode/dense/instantiations/bf16.cu",
 ];
 
 fn main() {

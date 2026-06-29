@@ -2,6 +2,8 @@
 
 /// Architecture detection and target metadata.
 pub mod arch;
+/// Dense decode parameter validation.
+pub mod dense_decode;
 /// CUDA device queries.
 pub mod device;
 /// Error types returned by the safe wrapper layer.
@@ -14,6 +16,10 @@ pub mod sparse_prefill;
 pub mod workspace;
 
 pub use arch::Arch;
+pub use dense_decode::{
+    DenseDecodeConfig, DenseDecodeDims, DenseDecodeLaunchParams, DenseDecodePlanMeta,
+    DenseDecodePlanParams, DenseDecodeStrides, dense_decode_bf16, dense_decode_plan,
+};
 pub use device::{DeviceInfo, get_device_info};
 pub use error::{Error, Result};
 pub use sparse_decode::{

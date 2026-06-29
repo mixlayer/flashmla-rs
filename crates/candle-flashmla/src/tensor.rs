@@ -57,6 +57,14 @@ pub(crate) mod cuda {
         }
     }
 
+    pub(crate) fn ensure_contiguous(t: &Tensor, name: &str) -> Result<()> {
+        if t.is_contiguous() {
+            Ok(())
+        } else {
+            invalid_arg(format!("{name} must be contiguous"))
+        }
+    }
+
     pub(crate) fn ensure_same_device(reference: &Tensor, t: &Tensor, name: &str) -> Result<()> {
         if reference.device().same_device(t.device()) {
             Ok(())

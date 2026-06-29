@@ -9,6 +9,7 @@
 #include <string>
 
 #include "params.h"
+#include "sm90/decode/dense/splitkv_mla.h"
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm90/prefill/sparse/fwd.h"
 #include "smxx/decode/combine/combine.h"
@@ -54,6 +55,18 @@ bool checked_mul_size(size_t left, size_t right, size_t* out) {
   }
   *out = left * right;
   return true;
+}
+
+bool checked_add_size(size_t left, size_t right, size_t* out) {
+  if (right > std::numeric_limits<size_t>::max() - left) {
+    return false;
+  }
+  *out = left + right;
+  return true;
+}
+
+int ceil_div_positive(int value, int divisor) {
+  return (value + divisor - 1) / divisor;
 }
 
 bool has_extra_decode_cache(const flashmla_sparse_decode_params_t* params) {
@@ -269,6 +282,207 @@ flashmla_status_t fill_sparse_decode_plan_result(
   result->lse_accum_elem_count = lse_accum;
   result->o_accum_elem_count = o_accum;
   return FLASHMLA_STATUS_SUCCESS;
+}
+
+flashmla_status_t validate_dense_decode_shape(
+  int batch,
+  int s_q,
+  int h_q,
+  int h_k,
+  int d_qk,
+  int d_v
+) {
+  if (batch <= 0 || s_q <= 0 || h_q <= 0 || h_k <= 0) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "batch, s_q, h_q, and h_k must be positive"
+    );
+  }
+  if (h_q % h_k != 0) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "h_k must divide h_q for dense decode"
+    );
+  }
+  if (d_qk != 512 && d_qk != 576) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "d_qk must be 512 or 576"
+    );
+  }
+  if (d_v != 512) {
+    return set_error(FLASHMLA_STATUS_INVALID_ARGUMENT, "d_v must be 512");
+  }
+
+  const int q_heads_per_hk = h_q / h_k;
+  if (q_heads_per_hk <= 0 ||
+      s_q > std::numeric_limits<int>::max() / q_heads_per_hk) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "q_seq_per_hk overflows int"
+    );
+  }
+
+  return FLASHMLA_STATUS_SUCCESS;
+}
+
+flashmla_status_t fill_dense_decode_plan_result(
+  int batch,
+  int s_q,
+  int h_q,
+  int h_k,
+  int d_v,
+  int num_sm,
+  flashmla_dense_decode_plan_result_t* result
+) {
+  if (num_sm <= 0) {
+    return set_error(FLASHMLA_STATUS_INVALID_ARGUMENT, "num_sm must be positive");
+  }
+
+  const int q_heads_per_hk = h_q / h_k;
+  const int q_seq_per_hk = s_q * q_heads_per_hk;
+  const int m_blocks = ceil_div_positive(q_seq_per_hk, 64);
+  const int num_sm_parts = std::max(num_sm / h_k / m_blocks, 1);
+  if (num_sm_parts > kDecodeMaxNumSmPartsForCombine) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "computed num_sm_parts exceeds the combine kernel maximum"
+    );
+  }
+
+  size_t total_splits = 0;
+  size_t lse_accum = 0;
+  size_t o_accum = 0;
+  if (!checked_add_size(static_cast<size_t>(batch), static_cast<size_t>(num_sm_parts), &total_splits) ||
+      !checked_mul_size(total_splits, static_cast<size_t>(h_k), &lse_accum) ||
+      !checked_mul_size(lse_accum, static_cast<size_t>(q_seq_per_hk), &lse_accum) ||
+      !checked_mul_size(lse_accum, static_cast<size_t>(d_v), &o_accum)) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "dense decode workspace element count overflow"
+    );
+  }
+
+  result->num_sm_parts = num_sm_parts;
+  result->fixed_overhead_num_blocks = 5;
+  result->block_size_n = 64;
+  result->q_seq_per_hk = q_seq_per_hk;
+  result->scheduler_metadata_i32_len =
+    static_cast<size_t>(num_sm_parts) * static_cast<size_t>(kDecodeSchedMetaI32Len);
+  result->num_splits_len = static_cast<size_t>(batch) + 1;
+  result->lse_accum_elem_count = lse_accum;
+  result->o_accum_elem_count = o_accum;
+  return FLASHMLA_STATUS_SUCCESS;
+}
+
+flashmla_status_t validate_dense_decode_plan_params(
+  const flashmla_dense_decode_plan_params_t* params,
+  flashmla_dense_decode_plan_result_t* result
+) {
+  if (params == nullptr) {
+    return set_error(FLASHMLA_STATUS_INVALID_ARGUMENT, "params must not be null");
+  }
+  if (result == nullptr) {
+    return set_error(FLASHMLA_STATUS_INVALID_ARGUMENT, "result must not be null");
+  }
+  if ((params->tile_scheduler_metadata == nullptr) != (params->num_splits == nullptr)) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "tile_scheduler_metadata and num_splits must either both be null or both be non-null"
+    );
+  }
+  if (params->tile_scheduler_metadata != nullptr && params->seqlens_k == nullptr) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "seqlens_k must not be null when generating dense decode scheduler metadata"
+    );
+  }
+
+  flashmla_status_t status = validate_dense_decode_shape(
+    params->batch,
+    params->s_q,
+    params->h_q,
+    params->h_k,
+    params->d_qk,
+    params->d_v
+  );
+  if (status != FLASHMLA_STATUS_SUCCESS) {
+    return status;
+  }
+
+  status = fill_dense_decode_plan_result(
+    params->batch,
+    params->s_q,
+    params->h_q,
+    params->h_k,
+    params->d_v,
+    params->num_sm,
+    result
+  );
+  if (status != FLASHMLA_STATUS_SUCCESS) {
+    return status;
+  }
+
+  return validate_current_device_sm90("dense decode wrapper only supports SM90");
+}
+
+flashmla_status_t validate_dense_decode_params(
+  const flashmla_dense_decode_params_t* params
+) {
+  if (params == nullptr) {
+    return set_error(FLASHMLA_STATUS_INVALID_ARGUMENT, "params must not be null");
+  }
+  if (params->q == nullptr || params->kcache == nullptr || params->seqlens_k == nullptr ||
+      params->block_table == nullptr || params->out == nullptr || params->lse == nullptr ||
+      params->lse_accum == nullptr || params->o_accum == nullptr ||
+      params->tile_scheduler_metadata == nullptr || params->num_splits == nullptr) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "q, kcache, seqlens_k, block_table, out, lse, lse_accum, o_accum, tile_scheduler_metadata, and num_splits must not be null"
+    );
+  }
+
+  flashmla_status_t status = validate_dense_decode_shape(
+    params->batch,
+    params->s_q,
+    params->h_q,
+    params->h_k,
+    params->d_qk,
+    params->d_v
+  );
+  if (status != FLASHMLA_STATUS_SUCCESS) {
+    return status;
+  }
+
+  if (params->num_blocks <= 0 || params->page_block_size <= 0) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "num_blocks and page_block_size must be positive"
+    );
+  }
+  if (params->page_block_size != 64) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "dense decode requires page_block_size to be 64"
+    );
+  }
+  if (params->num_sm_parts <= 0 || params->num_sm_parts > kDecodeMaxNumSmPartsForCombine) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "num_sm_parts must be between 1 and 160"
+    );
+  }
+  if (params->stride_q_b <= 0 || params->stride_q_row <= 0 ||
+      params->stride_q_head <= 0 || params->stride_k_block <= 0 ||
+      params->stride_k_row <= 0 || params->stride_k_head <= 0 ||
+      params->stride_block_table_b <= 0) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "dense decode strides must be positive"
+    );
+  }
+
+  return validate_current_device_sm90("dense decode wrapper only supports SM90");
 }
 
 flashmla_status_t validate_sparse_decode_plan_params(
@@ -559,6 +773,53 @@ flashmla_status_t flashmla_sparse_decode_plan(
   return clear_error();
 }
 
+flashmla_status_t flashmla_dense_decode_plan(
+  const flashmla_dense_decode_plan_params_t* params,
+  flashmla_dense_decode_plan_result_t* result
+) {
+  flashmla_status_t status = validate_dense_decode_plan_params(params, result);
+  if (status != FLASHMLA_STATUS_SUCCESS) {
+    return status;
+  }
+
+  if (params->tile_scheduler_metadata == nullptr) {
+    return clear_error();
+  }
+
+  try {
+    GetDecodeSchedMetaParams upstream_params = {
+      params->batch,
+      params->s_q,
+      result->block_size_n,
+      result->fixed_overhead_num_blocks,
+      -1,
+      -1,
+      nullptr,
+      nullptr,
+      const_cast<int*>(params->seqlens_k),
+      reinterpret_cast<DecodingSchedMeta*>(params->tile_scheduler_metadata),
+      params->num_splits,
+      result->num_sm_parts,
+      reinterpret_cast<cudaStream_t>(params->stream)
+    };
+    smxx::decode::run_get_decoding_sched_meta_kernel(upstream_params);
+  } catch (const std::exception& error) {
+    return set_error(FLASHMLA_STATUS_INTERNAL_ERROR, error.what());
+  } catch (...) {
+    return set_error(
+      FLASHMLA_STATUS_INTERNAL_ERROR,
+      "unknown exception while generating dense decode metadata"
+    );
+  }
+
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return set_cuda_error("dense decode metadata generation failed", error);
+  }
+
+  return clear_error();
+}
+
 flashmla_status_t flashmla_sparse_decode_bf16_fp8(
   const flashmla_sparse_decode_params_t* params
 ) {
@@ -693,6 +954,113 @@ flashmla_status_t flashmla_sparse_decode_bf16_fp8(
   cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) {
     return set_cuda_error("sparse decode launch failed", error);
+  }
+
+  return clear_error();
+}
+
+flashmla_status_t flashmla_dense_decode_bf16(
+  const flashmla_dense_decode_params_t* params
+) {
+  flashmla_status_t status = validate_dense_decode_params(params);
+  if (status != FLASHMLA_STATUS_SUCCESS) {
+    return status;
+  }
+
+  const int q_heads_per_hk = params->h_q / params->h_k;
+  const int q_seq_per_hk = params->s_q * q_heads_per_hk;
+  const int total_num_splits = params->batch + params->num_sm_parts;
+
+  try {
+    DenseAttnDecodeParams upstream_params;
+    upstream_params.b = params->batch;
+    upstream_params.s_q = params->s_q;
+    upstream_params.q_seq_per_hk = q_seq_per_hk;
+    upstream_params.d = params->d_qk;
+    upstream_params.d_v = params->d_v;
+    upstream_params.h_q = params->h_q;
+    upstream_params.h_k = params->h_k;
+    upstream_params.num_blocks = params->num_blocks;
+    upstream_params.q_head_per_hk = q_heads_per_hk;
+    upstream_params.is_causal = params->s_q == 1 ? false : params->is_causal != 0;
+    upstream_params.scale_softmax = params->sm_scale;
+    upstream_params.scale_softmax_log2 = params->sm_scale * kLog2E;
+
+    upstream_params.q_ptr = const_cast<void*>(params->q);
+    upstream_params.k_ptr = const_cast<void*>(params->kcache);
+    upstream_params.o_ptr = params->out;
+    upstream_params.softmax_lse_ptr = params->lse;
+
+    upstream_params.q_batch_stride = params->stride_q_b;
+    upstream_params.k_batch_stride = params->stride_k_block;
+    upstream_params.o_batch_stride = params->h_k * q_seq_per_hk * params->d_v;
+    upstream_params.q_row_stride = params->stride_q_row;
+    upstream_params.k_row_stride = params->stride_k_row;
+    upstream_params.o_row_stride = params->d_v;
+    upstream_params.q_head_stride = params->stride_q_head;
+    upstream_params.k_head_stride = params->stride_k_head;
+    upstream_params.o_head_stride = q_seq_per_hk * params->d_v;
+
+    upstream_params.block_table = const_cast<int*>(params->block_table);
+    upstream_params.block_table_batch_stride = params->stride_block_table_b;
+    upstream_params.page_block_size = params->page_block_size;
+    upstream_params.seqlens_k_ptr = const_cast<int*>(params->seqlens_k);
+
+    upstream_params.tile_scheduler_metadata_ptr =
+      reinterpret_cast<DecodingSchedMeta*>(params->tile_scheduler_metadata);
+    upstream_params.num_sm_parts = params->num_sm_parts;
+    upstream_params.num_splits_ptr = params->num_splits;
+
+    upstream_params.total_num_splits = total_num_splits;
+    upstream_params.softmax_lseaccum_ptr = params->lse_accum;
+    upstream_params.oaccum_ptr = params->o_accum;
+
+    upstream_params.stream = reinterpret_cast<cudaStream_t>(params->stream);
+
+    sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(upstream_params);
+
+    CombineParams combine_params = {
+      params->batch,
+      params->s_q,
+      params->h_q,
+      params->d_v,
+
+      params->lse,
+      params->out,
+      params->h_k * q_seq_per_hk,
+      params->h_q,
+      params->h_q * params->s_q * params->d_v,
+      params->h_q * params->d_v,
+      params->d_v,
+
+      params->lse_accum,
+      params->o_accum,
+      params->h_k * q_seq_per_hk,
+      params->h_q,
+      params->h_q * params->s_q * params->d_v,
+      params->h_q * params->d_v,
+      params->d_v,
+
+      reinterpret_cast<DecodingSchedMeta*>(params->tile_scheduler_metadata),
+      params->num_splits,
+      params->num_sm_parts,
+
+      nullptr,
+      reinterpret_cast<cudaStream_t>(params->stream)
+    };
+    smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine_params);
+  } catch (const std::exception& error) {
+    return set_error(FLASHMLA_STATUS_INTERNAL_ERROR, error.what());
+  } catch (...) {
+    return set_error(
+      FLASHMLA_STATUS_INTERNAL_ERROR,
+      "unknown exception while launching dense decode"
+    );
+  }
+
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return set_cuda_error("dense decode launch failed", error);
   }
 
   return clear_error();
