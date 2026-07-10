@@ -94,9 +94,15 @@ pub fn sparse_prefill(
     };
     dims.validate()?;
 
-    let out = Tensor::zeros((s_q, h_q, config.d_v), DType::BF16, q.device())?;
-    let max_logits = Tensor::zeros((s_q, h_q), DType::F32, q.device())?;
-    let lse = Tensor::zeros((s_q, h_q), DType::F32, q.device())?;
+    // SAFETY: The FlashMLA prefill kernel fully overwrites `out`, `max_logits`, and `lse`
+    // for every query/head element before these tensors are returned.
+    let (out, max_logits, lse) = unsafe {
+        (
+            Tensor::empty((s_q, h_q, config.d_v), DType::BF16, q.device())?,
+            Tensor::empty((s_q, h_q), DType::F32, q.device())?,
+            Tensor::empty((s_q, h_q), DType::F32, q.device())?,
+        )
+    };
 
     let (stream, device_id) = stream_and_device_id(q)?;
     let device = get_device_info(device_id)?;

@@ -118,7 +118,9 @@ pub fn sparse_decode_plan(
         DType::I32,
         q.device(),
     )?;
-    let num_splits = Tensor::zeros((meta.num_splits_len,), DType::I32, q.device())?;
+    // SAFETY: The second FlashMLA planning call writes every split-offset element before
+    // the plan is returned or used by decode.
+    let num_splits = unsafe { Tensor::empty((meta.num_splits_len,), DType::I32, q.device())? };
     let lse_accum = Tensor::zeros(lse_accum_shape, DType::F32, q.device())?;
     let o_accum = Tensor::zeros(o_accum_shape, DType::F32, q.device())?;
 
@@ -215,12 +217,17 @@ pub fn sparse_decode(
     )?;
     validate_plan_tensors(q, dims, plan)?;
 
-    let out = Tensor::zeros(
-        (dims.batch, dims.s_q, dims.h_q, dims.d_v),
-        DType::BF16,
-        q.device(),
-    )?;
-    let lse_internal = Tensor::zeros((dims.batch, dims.s_q, dims.h_q), DType::F32, q.device())?;
+    // SAFETY: Sparse decode writes every output and LSE element before returning these tensors.
+    let (out, lse_internal) = unsafe {
+        (
+            Tensor::empty(
+                (dims.batch, dims.s_q, dims.h_q, dims.d_v),
+                DType::BF16,
+                q.device(),
+            )?,
+            Tensor::empty((dims.batch, dims.s_q, dims.h_q), DType::F32, q.device())?,
+        )
+    };
 
     let (stream, _device_id) = stream_and_device_id(q)?;
     let q_stride = q.stride();
