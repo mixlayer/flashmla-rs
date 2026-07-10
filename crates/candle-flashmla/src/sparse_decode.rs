@@ -111,7 +111,7 @@ pub fn sparse_decode_plan(
         return invalid_arg("invalid sparse decode scheduler metadata shape");
     }
     let metadata_i32_per_part = meta.scheduler_metadata_i32_len / meta.num_sm_parts;
-    let total_num_splits = meta.total_num_splits(dims)?;
+    let (lse_accum_shape, o_accum_shape) = decode_workspace_shapes(meta, dims)?;
 
     let scheduler_metadata = Tensor::zeros(
         (meta.num_sm_parts, metadata_i32_per_part),
@@ -119,16 +119,8 @@ pub fn sparse_decode_plan(
         q.device(),
     )?;
     let num_splits = Tensor::zeros((meta.num_splits_len,), DType::I32, q.device())?;
-    let lse_accum = Tensor::zeros(
-        (total_num_splits, dims.s_q, dims.h_q),
-        DType::F32,
-        q.device(),
-    )?;
-    let o_accum = Tensor::zeros(
-        (total_num_splits, dims.s_q, dims.h_q, dims.d_v),
-        DType::F32,
-        q.device(),
-    )?;
+    let lse_accum = Tensor::zeros(lse_accum_shape, DType::F32, q.device())?;
+    let o_accum = Tensor::zeros(o_accum_shape, DType::F32, q.device())?;
 
     {
         let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
@@ -638,14 +630,41 @@ fn validate_plan_tensors(
         ));
     }
 
-    let total_num_splits = plan.meta.total_num_splits(dims)?;
-    if plan.lse_accum.dims3()? != (total_num_splits, dims.s_q, dims.h_q) {
+    let (lse_accum_shape, o_accum_shape) = decode_workspace_shapes(plan.meta, dims)?;
+    if plan.lse_accum.dims3()? != lse_accum_shape {
         return invalid_arg("lse_accum shape does not match sparse decode plan metadata");
     }
-    if plan.o_accum.dims4()? != (total_num_splits, dims.s_q, dims.h_q, dims.d_v) {
+    if plan.o_accum.dims4()? != o_accum_shape {
         return invalid_arg("o_accum shape does not match sparse decode plan metadata");
     }
     Ok(())
+}
+
+fn decode_workspace_shapes(
+    meta: SparseDecodePlanMeta,
+    dims: SparseDecodeDims,
+) -> Result<((usize, usize, usize), (usize, usize, usize, usize))> {
+    if meta.num_sm_parts == 1 {
+        if meta.lse_accum_elem_count != 1 || meta.o_accum_elem_count != 1 {
+            return invalid_arg("no-split sparse decode plan must use scalar accumulators");
+        }
+        return Ok(((1, 1, 1), (1, 1, 1, 1)));
+    }
+
+    let total_num_splits = meta.total_num_splits(dims)?;
+    let lse_shape = (total_num_splits, dims.s_q, dims.h_q);
+    let o_shape = (total_num_splits, dims.s_q, dims.h_q, dims.d_v);
+    let lse_elems = total_num_splits
+        .checked_mul(dims.s_q)
+        .and_then(|value| value.checked_mul(dims.h_q))
+        .ok_or_else(|| crate::Error::Tensor("sparse decode LSE workspace overflow".to_string()))?;
+    let o_elems = lse_elems.checked_mul(dims.d_v).ok_or_else(|| {
+        crate::Error::Tensor("sparse decode output workspace overflow".to_string())
+    })?;
+    if meta.lse_accum_elem_count != lse_elems || meta.o_accum_elem_count != o_elems {
+        return invalid_arg("sparse decode accumulator sizing metadata is inconsistent");
+    }
+    Ok((lse_shape, o_shape))
 }
 
 fn ensure_kv_cache_dtype(t: &Tensor, name: &str) -> Result<()> {
@@ -662,6 +681,63 @@ mod tests {
     use candle::{DType, Device, Tensor};
 
     use super::*;
+
+    fn test_decode_dims() -> SparseDecodeDims {
+        SparseDecodeDims {
+            batch: 1,
+            s_q: 1024,
+            h_q: 64,
+            h_kv: 1,
+            d_qk: 576,
+            d_v: 512,
+            num_blocks: 1,
+            page_block_size: 64,
+            topk: 2048,
+            extra_num_blocks: 0,
+            extra_page_block_size: 0,
+            extra_topk: 0,
+        }
+    }
+
+    fn test_plan_meta(
+        num_sm_parts: usize,
+        lse_accum_elem_count: usize,
+        o_accum_elem_count: usize,
+    ) -> SparseDecodePlanMeta {
+        SparseDecodePlanMeta {
+            num_sm_parts,
+            fixed_overhead_num_blocks: 5,
+            block_size_topk: 64,
+            scheduler_metadata_i32_len: num_sm_parts * 8,
+            num_splits_len: 2,
+            lse_accum_elem_count,
+            o_accum_elem_count,
+        }
+    }
+
+    #[test]
+    fn no_split_decode_uses_scalar_workspaces() -> Result<()> {
+        let shapes = decode_workspace_shapes(test_plan_meta(1, 1, 1), test_decode_dims())?;
+        assert_eq!(shapes, ((1, 1, 1), (1, 1, 1, 1)));
+        Ok(())
+    }
+
+    #[test]
+    fn split_decode_keeps_full_workspaces() -> Result<()> {
+        let dims = test_decode_dims();
+        let total_splits = dims.batch + 2;
+        let lse_elems = total_splits * dims.s_q * dims.h_q;
+        let o_elems = lse_elems * dims.d_v;
+        let shapes = decode_workspace_shapes(test_plan_meta(2, lse_elems, o_elems), dims)?;
+        assert_eq!(
+            shapes,
+            (
+                (total_splits, dims.s_q, dims.h_q),
+                (total_splits, dims.s_q, dims.h_q, dims.d_v)
+            )
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires a visible SM90 CUDA GPU"]
@@ -704,6 +780,56 @@ mod tests {
         assert_eq!(output.out.dims4()?, (1, 1, 64, 512));
         assert_eq!(output.out.dtype(), DType::BF16);
         assert_eq!(output.lse.dims3()?, (1, 64, 1));
+        device.synchronize()?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a visible SM90 CUDA GPU"]
+    fn sparse_decode_sm90_no_split_smoke() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let q = Tensor::zeros((1, 1024, 64, 576), DType::BF16, &device)?;
+        let kv_cache = Tensor::zeros((1, 64, 1, 656), DType::U8, &device)?;
+        let indices = Tensor::zeros((1, 1024, 64), DType::I32, &device)?;
+        let mut plan = sparse_decode_plan(
+            &q,
+            &kv_cache,
+            &indices,
+            None,
+            None,
+            None,
+            None,
+            SparseDecodeConfig {
+                softmax_scale: 1.0,
+                d_v: 512,
+                pad_heads: false,
+            },
+        )?;
+        assert_eq!(plan.meta.num_sm_parts, 1);
+        assert_eq!(plan.meta.lse_accum_elem_count, 1);
+        assert_eq!(plan.meta.o_accum_elem_count, 1);
+        assert_eq!(plan.lse_accum.dims3()?, (1, 1, 1));
+        assert_eq!(plan.o_accum.dims4()?, (1, 1, 1, 1));
+
+        let output = sparse_decode(
+            &q,
+            &kv_cache,
+            &indices,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut plan,
+            SparseDecodeConfig {
+                softmax_scale: 1.0,
+                d_v: 512,
+                pad_heads: false,
+            },
+        )?;
+        assert_eq!(output.out.dims4()?, (1, 1024, 64, 512));
+        assert_eq!(output.lse.dims3()?, (1, 64, 1024));
         device.synchronize()?;
 
         Ok(())

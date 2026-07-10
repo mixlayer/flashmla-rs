@@ -248,16 +248,21 @@ flashmla_status_t fill_sparse_decode_plan_result(
     );
   }
 
-  size_t lse_accum = 0;
-  size_t o_accum = 0;
-  size_t total_splits = static_cast<size_t>(batch) + static_cast<size_t>(num_sm_parts);
-  if (!checked_mul_size(total_splits, static_cast<size_t>(s_q), &lse_accum) ||
-      !checked_mul_size(lse_accum, static_cast<size_t>(h_q), &lse_accum) ||
-      !checked_mul_size(lse_accum, static_cast<size_t>(d_v), &o_accum)) {
-    return set_error(
-      FLASHMLA_STATUS_INVALID_ARGUMENT,
-      "sparse decode workspace element count overflow"
-    );
+  // With one partition every request is unsplit and the decode kernel writes
+  // directly to out/lse. Keep one element because the raw launch API requires
+  // non-null accumulator pointers, but no accumulator element is accessed.
+  size_t lse_accum = 1;
+  size_t o_accum = 1;
+  if (num_sm_parts > 1) {
+    size_t total_splits = static_cast<size_t>(batch) + static_cast<size_t>(num_sm_parts);
+    if (!checked_mul_size(total_splits, static_cast<size_t>(s_q), &lse_accum) ||
+        !checked_mul_size(lse_accum, static_cast<size_t>(h_q), &lse_accum) ||
+        !checked_mul_size(lse_accum, static_cast<size_t>(d_v), &o_accum)) {
+      return set_error(
+        FLASHMLA_STATUS_INVALID_ARGUMENT,
+        "sparse decode workspace element count overflow"
+      );
+    }
   }
 
   result->num_sm_parts = num_sm_parts;
@@ -651,6 +656,9 @@ flashmla_status_t flashmla_sparse_decode_bf16_fp8(
       }
     }
 
+    // Preserve upstream's PDL combine launch even for one-part schedules. Its
+    // CTAs return without touching the scalar accumulators, while retaining
+    // upstream launch and ordering semantics for downstream work.
     CombineParams combine_params = {
       params->batch,
       params->s_q,
