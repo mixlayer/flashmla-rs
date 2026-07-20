@@ -541,6 +541,16 @@ After SM90 is working:
 4. Validate SM100 prefill and decode on a B200/GB200 node.
 5. Keep SM90 and SM100 artifacts separately cacheable.
 
+Progress (2026-07-20):
+
+- sparse BF16 prefill now selects and caches an architecture-specific SM90 or
+  SM100 source set, requires CUDA 12.9+ for SM100, and dispatches the native
+  head-64/head-128 Blackwell kernels through the C ABI;
+- a B200 numerical test covers BF16 inputs, sparse indices, top-k lengths, and
+  attention sinks against a host reference;
+- SM100 sparse decode remains to be bound and validated separately because its
+  FP8 paged-cache launch and workspace contract differ from SM90.
+
 ## Known Gaps and Risks
 
 - FlashMLA does not support SM120/121, so local desktop development must use FlashInfer sparse MLA or CPU/reference fallbacks.
@@ -567,4 +577,3 @@ Production-ready milestone:
 - Workspace planning is explicit and reusable.
 - SM90 and SM100 build paths are validated.
 - modeld can choose FlashMLA for SM90/SM100 and FlashInfer for SM120/121.
-

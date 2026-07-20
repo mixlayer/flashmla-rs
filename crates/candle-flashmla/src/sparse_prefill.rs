@@ -200,8 +200,8 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires a visible SM90 CUDA GPU"]
-    fn sparse_prefill_sm90_smoke() -> Result<()> {
+    #[ignore = "requires a visible SM90 or SM100 CUDA GPU"]
+    fn sparse_prefill_cuda_smoke() -> Result<()> {
         let device = Device::new_cuda(0)?;
         let q = Tensor::zeros((16, 64, 512), DType::BF16, &device)?;
         let kv = Tensor::zeros((128, 1, 512), DType::BF16, &device)?;
@@ -224,6 +224,90 @@ mod tests {
         assert_eq!(output.max_logits.dims2()?, (16, 64));
         assert_eq!(output.lse.dims2()?, (16, 64));
         device.synchronize()?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a visible SM90 or SM100 CUDA GPU"]
+    fn sparse_prefill_matches_reference() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let (s_q, s_kv, h_q, d_qk, topk) = (2, 160, 64, 512, 128);
+        let q_values = (0..s_q * h_q * d_qk)
+            .map(|index| ((index % 31) as f32 - 15.0) * 0.01)
+            .collect::<Vec<_>>();
+        let kv_values = (0..s_kv * d_qk)
+            .map(|index| ((index % 29) as f32 - 14.0) * 0.0125)
+            .collect::<Vec<_>>();
+        let index_values = (0..s_q * topk)
+            .map(|index| i32::try_from((index * 17 + 3) % s_kv).unwrap())
+            .collect::<Vec<_>>();
+        let topk_lengths = vec![97i32, 128];
+        let sink_values = (0..h_q)
+            .map(|head| (head as f32 - 31.5) * 0.005)
+            .collect::<Vec<_>>();
+
+        let q = Tensor::from_vec(q_values, (s_q, h_q, d_qk), &device)?.to_dtype(DType::BF16)?;
+        let kv = Tensor::from_vec(kv_values, (s_kv, 1, d_qk), &device)?.to_dtype(DType::BF16)?;
+        let indices = Tensor::from_vec(index_values.clone(), (s_q, 1, topk), &device)?;
+        let topk_length = Tensor::from_vec(topk_lengths.clone(), s_q, &device)?;
+        let attn_sink = Tensor::from_vec(sink_values.clone(), h_q, &device)?;
+        let scale = (d_qk as f32).sqrt().recip();
+        let output = sparse_prefill(
+            &q,
+            &kv,
+            &indices,
+            Some(&topk_length),
+            Some(&attn_sink),
+            SparsePrefillConfig {
+                softmax_scale: scale,
+                d_v: d_qk,
+                pad_heads: false,
+            },
+        )?
+        .out
+        .to_dtype(DType::F32)?
+        .to_vec3::<f32>()?;
+
+        let q = q.to_dtype(DType::F32)?.to_vec3::<f32>()?;
+        let kv = kv.to_dtype(DType::F32)?.to_vec3::<f32>()?;
+        for query in 0..s_q {
+            let valid_topk = usize::try_from(topk_lengths[query]).unwrap();
+            for head in 0..h_q {
+                let mut scores = Vec::with_capacity(valid_topk);
+                for &index in &index_values[query * topk..query * topk + valid_topk] {
+                    let index = usize::try_from(index).unwrap();
+                    let dot = q[query][head]
+                        .iter()
+                        .zip(&kv[index][0])
+                        .map(|(q, kv)| q * kv)
+                        .sum::<f32>();
+                    scores.push((index, dot * scale));
+                }
+                let max_score = scores
+                    .iter()
+                    .map(|(_, score)| *score)
+                    .fold(sink_values[head], f32::max);
+                let denominator = (sink_values[head] - max_score).exp()
+                    + scores
+                        .iter()
+                        .map(|(_, score)| (*score - max_score).exp())
+                        .sum::<f32>();
+                for dim in 0..d_qk {
+                    let expected = scores
+                        .iter()
+                        .map(|(index, score)| (*score - max_score).exp() * kv[*index][0][dim])
+                        .sum::<f32>()
+                        / denominator;
+                    let error = (output[query][head][dim] - expected).abs();
+                    assert!(
+                        error <= 0.005,
+                        "mismatch at query={query} head={head} dim={dim}: got {}, expected {expected}, error {error}",
+                        output[query][head][dim]
+                    );
+                }
+            }
+        }
 
         Ok(())
     }

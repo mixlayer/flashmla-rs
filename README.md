@@ -98,7 +98,7 @@ Status values:
 
 | Kernel | SM90 / Hopper | SM100 / Blackwell | SM120 / SM121 |
 | --- | --- | --- | --- |
-| Sparse BF16 prefill | Done: C ABI, Rust wrapper, Candle API, smoke test | Planned: upstream sources identified, dispatch/build not wired | Unsupported |
+| Sparse BF16 prefill | Done: C ABI, Rust wrapper, Candle API, smoke test | Done: C ABI, Rust wrapper, Candle API, B200 reference test | Unsupported |
 | Sparse BF16-query / FP8-cache decode | Done: C ABI, Rust wrapper, Candle plan/run API, smoke test | Planned: upstream sources identified, dispatch/build not wired | Unsupported |
 | Dense prefill | Planned | Planned | Unsupported |
 | Dense decode | Planned | Planned | Unsupported |
@@ -113,5 +113,5 @@ Status values:
   not synchronize.
 - Sparse decode uses explicit caller-owned scheduler metadata, `num_splits`, `lse_accum`, and
   `o_accum` buffers allocated by the Candle integration layer.
-- SM100 support should be added by making the build source set and runtime C ABI dispatch
-  architecture-aware before adding the SM100 kernel calls.
+- Sparse prefill builds architecture-specific SM90 or SM100 source sets and dispatches through the
+  matching C ABI path. SM100 sparse decode remains planned.

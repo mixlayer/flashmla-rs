@@ -82,11 +82,11 @@ impl SparsePrefillDims {
         Ok(())
     }
 
-    fn validate_sm90(self) -> Result<()> {
+    fn validate_launch(self) -> Result<()> {
         self.validate()?;
-        if self.topk % 128 != 0 {
+        if self.topk % 64 != 0 {
             return Err(Error::InvalidArgument(format!(
-                "SM90 sparse prefill requires topk to be a multiple of 128, got {}",
+                "sparse prefill requires topk to be a multiple of 64, got {}",
                 self.topk
             )));
         }
@@ -157,7 +157,7 @@ pub struct SparsePrefillLaunchParams {
 
 impl SparsePrefillLaunchParams {
     fn validate(self) -> Result<()> {
-        self.dims.validate_sm90()?;
+        self.dims.validate_launch()?;
         self.strides.validate()?;
         if self.config.d_v != self.dims.d_v {
             return Err(Error::InvalidArgument(format!(
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn sm90_validation_rejects_non_multiple_topk() {
+    fn launch_validation_rejects_non_multiple_topk() {
         let dims = SparsePrefillDims {
             s_q: 16,
             s_kv: 128,
@@ -276,8 +276,22 @@ mod tests {
             topk: 32,
         };
         assert!(matches!(
-            dims.validate_sm90(),
+            dims.validate_launch(),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn launch_validation_accepts_sm100_head64_alignment() {
+        let dims = SparsePrefillDims {
+            s_q: 1,
+            s_kv: 128,
+            h_q: 64,
+            h_kv: 1,
+            d_qk: 512,
+            d_v: 512,
+            topk: 64,
+        };
+        dims.validate_launch().unwrap();
     }
 }
