@@ -5,4 +5,7 @@ edition.workspace = true
 build = "build.rs"
 links = "flashmla"
 
+[features]
+unsupported_arch = []
+
 [dependencies]

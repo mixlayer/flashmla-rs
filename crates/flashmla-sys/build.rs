@@ -21,14 +21,9 @@ const UPSTREAM_SM90_SOURCES: &[&str] = &[
 ];
 
 fn main() {
-    let flashmla_root = discover_flashmla_root();
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo"),
     );
-    let cuda_root = discover_cuda_root();
-    let nvcc = cuda_root.join("bin").join("nvcc");
-    let ar = find_program("ar").unwrap_or_else(|| PathBuf::from("ar"));
-    let arch = selected_arch();
 
     println!("cargo:rerun-if-env-changed=FLASHMLA_ROOT");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -43,6 +38,27 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FLASHMLA_PTXAS_VERBOSE");
     println!("cargo:rerun-if-changed=csrc/flashmla_c_api.h");
     println!("cargo:rerun-if-changed=csrc/flashmla_c_api.cu");
+
+    let arch = match selected_arch() {
+        Ok(arch) => arch,
+        Err(warning) => {
+            let flashmla_root = configured_flashmla_root(&manifest_dir);
+            println!("cargo:warning={warning}; enabling the unsupported_arch feature");
+            println!("cargo:rustc-cfg=feature=\"unsupported_arch\"");
+            println!(
+                "cargo:rustc-env=FLASHMLA_SOURCE_ROOT={}",
+                flashmla_root.display()
+            );
+            println!("cargo:metadata=source_root={}", flashmla_root.display());
+            return;
+        }
+    };
+
+    let flashmla_root = discover_flashmla_root(&manifest_dir);
+    let cuda_root = discover_cuda_root();
+    let nvcc = cuda_root.join("bin").join("nvcc");
+    let ar = find_program("ar").unwrap_or_else(|| PathBuf::from("ar"));
+
     for source in UPSTREAM_SM90_SOURCES {
         println!(
             "cargo:rerun-if-changed={}",
@@ -94,21 +110,21 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
-fn discover_flashmla_root() -> PathBuf {
-    if let Some(root) = env::var_os("FLASHMLA_ROOT") {
-        if root.is_empty() {
-            panic!("FLASHMLA_ROOT is set but empty");
-        }
-        return validate_flashmla_root(PathBuf::from(root), "FLASHMLA_ROOT");
+fn configured_flashmla_root(manifest_dir: &Path) -> PathBuf {
+    match env::var_os("FLASHMLA_ROOT") {
+        Some(root) if root.is_empty() => panic!("FLASHMLA_ROOT is set but empty"),
+        Some(root) => PathBuf::from(root),
+        None => manifest_dir.join("vendor").join("FlashMLA"),
     }
+}
 
-    let manifest_dir = PathBuf::from(
-        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo"),
-    );
-    validate_flashmla_root(
-        manifest_dir.join("vendor").join("FlashMLA"),
-        "vendored FlashMLA submodule",
-    )
+fn discover_flashmla_root(manifest_dir: &Path) -> PathBuf {
+    let source = if env::var_os("FLASHMLA_ROOT").is_some() {
+        "FLASHMLA_ROOT"
+    } else {
+        "vendored FlashMLA submodule"
+    };
+    validate_flashmla_root(configured_flashmla_root(manifest_dir), source)
 }
 
 fn validate_flashmla_root(path: PathBuf, source: &str) -> PathBuf {
@@ -185,7 +201,7 @@ fn validate_cuda_root(path: PathBuf, source: &str) -> PathBuf {
     root
 }
 
-fn selected_arch() -> Arch {
+fn selected_arch() -> Result<Arch, String> {
     if let Some(archs) = env::var_os("FLASHMLA_ARCHS") {
         let archs = archs.to_string_lossy();
         let parsed: Vec<_> = archs
@@ -204,11 +220,11 @@ fn selected_arch() -> Arch {
     match env::var("CUDA_COMPUTE_CAP") {
         Ok(value) if !value.trim().is_empty() => parse_arch(value.trim(), "CUDA_COMPUTE_CAP"),
         Ok(_) => panic!("CUDA_COMPUTE_CAP is set but empty"),
-        Err(_) => Arch::Sm90a,
+        Err(_) => Ok(Arch::Sm90a),
     }
 }
 
-fn parse_arch(value: &str, source: &str) -> Arch {
+fn parse_arch(value: &str, source: &str) -> Result<Arch, String> {
     let normalized: String = value
         .trim()
         .to_ascii_lowercase()
@@ -217,18 +233,16 @@ fn parse_arch(value: &str, source: &str) -> Arch {
         .collect();
 
     match normalized.as_str() {
-        "90" | "90a" | "sm90" | "sm90a" | "compute90a" => Arch::Sm90a,
-        "100" | "100f" | "sm100" | "sm100f" | "compute100f" => {
-            panic!(
-                "{source}={value:?} requested SM100, but bindings not implemented by this crate yet"
-            )
-        }
-        "120" | "121" | "sm120" | "sm121" => {
-            panic!("{source}={value:?} is unsupported by upstream FlashMLA sparse MLA")
-        }
-        _ => panic!(
-            "{source}={value:?} is unsupported. Use CUDA_COMPUTE_CAP=90 or FLASHMLA_ARCHS=sm90a."
-        ),
+        "90" | "90a" | "sm90" | "sm90a" | "compute90a" => Ok(Arch::Sm90a),
+        "100" | "100f" | "sm100" | "sm100f" | "compute100f" => Err(format!(
+            "{source}={value:?} requested SM100, but bindings are not implemented by this crate yet"
+        )),
+        "120" | "121" | "sm120" | "sm121" => Err(format!(
+            "{source}={value:?} is unsupported by upstream FlashMLA sparse MLA"
+        )),
+        _ => Err(format!(
+            "{source}={value:?} is unsupported. Use CUDA_COMPUTE_CAP=90 or FLASHMLA_ARCHS=sm90a"
+        )),
     }
 }
 

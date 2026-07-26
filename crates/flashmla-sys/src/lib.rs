@@ -1,7 +1,9 @@
 #![allow(non_camel_case_types)]
 //! Raw FlashMLA C ABI bindings.
 
-use core::ffi::{c_char, c_int, c_void};
+#[cfg(not(feature = "unsupported_arch"))]
+use core::ffi::c_char;
+use core::ffi::{c_int, c_void};
 
 /// Opaque CUDA stream handle used by the FlashMLA C ABI.
 pub type cudaStream_t = *mut c_void;
@@ -266,6 +268,7 @@ pub struct flashmla_sparse_decode_params_t {
     pub stream: cudaStream_t,
 }
 
+#[cfg(not(feature = "unsupported_arch"))]
 unsafe extern "C" {
     /// Returns a thread-local error string for the most recent non-success C ABI call.
     pub fn flashmla_last_error() -> *const c_char;
@@ -305,7 +308,7 @@ unsafe extern "C" {
     ) -> flashmla_status_t;
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "unsupported_arch")))]
 mod tests {
     use std::ffi::CStr;
 
