@@ -58,6 +58,16 @@ Useful build variables:
 - `NVCC_THREADS=N`: passes `--threads N` to `nvcc`.
 - `FLASHMLA_PTXAS_VERBOSE=1`: enables verbose ptxas output.
 
+### Unsupported architectures
+
+When the selected architecture has no implemented FlashMLA path, the build script emits a Cargo
+warning, enables the `unsupported_arch` configuration, and skips CUDA source compilation and native
+linking. This allows every crate in the workspace to compile on targets such as SM120 and SM121.
+`flashmla-sys` provides ABI-compatible stubs in this configuration: kernel and device-query calls
+return `FLASHMLA_STATUS_UNSUPPORTED_ARCH`, and `flashmla_last_error()` reports that FlashMLA is
+unavailable on the selected architecture. The stubs do not provide a kernel fallback; callers
+should use another implementation such as FlashInfer.
+
 ### `flashmla-sys`
 
 Raw FFI and CUDA build crate.

@@ -1,9 +1,7 @@
 #![allow(non_camel_case_types)]
 //! Raw FlashMLA C ABI bindings.
 
-#[cfg(not(feature = "unsupported_arch"))]
-use core::ffi::c_char;
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_char, c_int, c_void};
 
 /// Opaque CUDA stream handle used by the FlashMLA C ABI.
 pub type cudaStream_t = *mut c_void;
@@ -308,6 +306,72 @@ unsafe extern "C" {
     ) -> flashmla_status_t;
 }
 
+#[cfg(feature = "unsupported_arch")]
+mod unsupported_arch {
+    use super::*;
+
+    const LAST_ERROR: &[u8] = b"FlashMLA is unavailable on the selected architecture\0";
+
+    /// Returns a static error string explaining that the selected architecture is unsupported.
+    ///
+    /// The returned pointer is non-null, NUL-terminated, and valid for the lifetime of the
+    /// process. The caller must not modify or free it.
+    pub unsafe extern "C" fn flashmla_last_error() -> *const c_char {
+        LAST_ERROR.as_ptr().cast()
+    }
+
+    /// Reports that device queries are unavailable on the selected architecture.
+    ///
+    /// This stub does not inspect `device_id`, dereference or write any output pointer, access
+    /// CUDA, or synchronize. The output pointers may be null or otherwise invalid.
+    pub unsafe extern "C" fn flashmla_get_device_info(
+        _device_id: c_int,
+        _major: *mut c_int,
+        _minor: *mut c_int,
+        _num_sms: *mut c_int,
+    ) -> flashmla_status_t {
+        flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH
+    }
+
+    /// Reports that sparse BF16 prefill is unavailable on the selected architecture.
+    ///
+    /// This stub does not dereference `params`, inspect its dtype, shape, strides, pointers, or
+    /// stream, launch CUDA work, or synchronize. `params` may be null or otherwise invalid.
+    pub unsafe extern "C" fn flashmla_sparse_prefill_bf16(
+        _params: *const flashmla_sparse_prefill_params_t,
+    ) -> flashmla_status_t {
+        flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH
+    }
+
+    /// Reports that sparse decode planning is unavailable on the selected architecture.
+    ///
+    /// This stub does not dereference `params` or `result`, inspect any dtype, shape, stride,
+    /// pointer, or stream, write output, launch CUDA work, or synchronize. Both pointers may be
+    /// null or otherwise invalid.
+    pub unsafe extern "C" fn flashmla_sparse_decode_plan(
+        _params: *const flashmla_sparse_decode_plan_params_t,
+        _result: *mut flashmla_sparse_decode_plan_result_t,
+    ) -> flashmla_status_t {
+        flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH
+    }
+
+    /// Reports that sparse BF16/FP8 decode is unavailable on the selected architecture.
+    ///
+    /// This stub does not dereference `params`, inspect its dtype, shape, strides, pointers, or
+    /// stream, launch CUDA work, or synchronize. `params` may be null or otherwise invalid.
+    pub unsafe extern "C" fn flashmla_sparse_decode_bf16_fp8(
+        _params: *const flashmla_sparse_decode_params_t,
+    ) -> flashmla_status_t {
+        flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH
+    }
+}
+
+#[cfg(feature = "unsupported_arch")]
+pub use unsupported_arch::{
+    flashmla_get_device_info, flashmla_last_error, flashmla_sparse_decode_bf16_fp8,
+    flashmla_sparse_decode_plan, flashmla_sparse_prefill_bf16,
+};
+
 #[cfg(all(test, not(feature = "unsupported_arch")))]
 mod tests {
     use std::ffi::CStr;
@@ -337,5 +401,40 @@ mod tests {
 
         let status = unsafe { flashmla_sparse_decode_bf16_fp8(std::ptr::null()) };
         assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_INVALID_ARGUMENT);
+    }
+}
+
+#[cfg(all(test, feature = "unsupported_arch"))]
+mod unsupported_arch_tests {
+    use std::ffi::CStr;
+
+    use super::*;
+
+    #[test]
+    fn ffi_stubs_report_unsupported_arch() {
+        let message = unsafe { CStr::from_ptr(flashmla_last_error()) };
+        assert_eq!(
+            message.to_str().unwrap(),
+            "FlashMLA is unavailable on the selected architecture"
+        );
+
+        let status = unsafe {
+            flashmla_get_device_info(
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH);
+
+        let status = unsafe { flashmla_sparse_prefill_bf16(std::ptr::null()) };
+        assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH);
+
+        let status = unsafe { flashmla_sparse_decode_plan(std::ptr::null(), std::ptr::null_mut()) };
+        assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH);
+
+        let status = unsafe { flashmla_sparse_decode_bf16_fp8(std::ptr::null()) };
+        assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_UNSUPPORTED_ARCH);
     }
 }
