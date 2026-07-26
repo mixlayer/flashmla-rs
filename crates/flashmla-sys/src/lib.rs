@@ -148,6 +148,139 @@ pub struct flashmla_sparse_decode_plan_result_t {
     pub o_accum_elem_count: usize,
 }
 
+/// Raw dense decode scheduler metadata generation parameters.
+///
+/// All pointers are CUDA device pointers unless otherwise noted. `seqlens_k` is required when
+/// `tile_scheduler_metadata` and `num_splits` are non-null, and is shaped `[batch]` with I32
+/// sequence lengths. The metadata outputs may both be null to request size calculation without
+/// launching the metadata kernel.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct flashmla_dense_decode_plan_params_t {
+    /// Batch size.
+    pub batch: c_int,
+    /// Query sequence length before query-head packing.
+    pub s_q: c_int,
+    /// Query head count.
+    pub h_q: c_int,
+    /// KV head count.
+    pub h_k: c_int,
+    /// Query/key head dimension.
+    pub d_qk: c_int,
+    /// Value head dimension.
+    pub d_v: c_int,
+
+    /// Optional I32 KV sequence lengths shaped `[batch]`.
+    pub seqlens_k: *const c_int,
+
+    /// Optional writable I32 scheduler metadata buffer.
+    pub tile_scheduler_metadata: *mut c_int,
+    /// Optional writable I32 split-offset buffer shaped `[batch + 1]`.
+    pub num_splits: *mut c_int,
+
+    /// Number of SMs on the target CUDA device.
+    pub num_sm: c_int,
+    /// CUDA stream used for optional metadata generation.
+    pub stream: cudaStream_t,
+}
+
+/// Workspace sizing result for dense decode.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct flashmla_dense_decode_plan_result_t {
+    /// Number of SM partitions used by split-KV decode.
+    pub num_sm_parts: c_int,
+    /// Fixed scheduler overhead, in KV blocks.
+    pub fixed_overhead_num_blocks: c_int,
+    /// KV block size used by the scheduler.
+    pub block_size_n: c_int,
+    /// Packed query sequence length per KV head, equal to `s_q * h_q / h_k`.
+    pub q_seq_per_hk: c_int,
+    /// Required I32 elements in `tile_scheduler_metadata`.
+    pub scheduler_metadata_i32_len: usize,
+    /// Required I32 elements in `num_splits`.
+    pub num_splits_len: usize,
+    /// Required F32 elements in dense internal LSE accumulation workspace.
+    pub lse_accum_elem_count: usize,
+    /// Required F32 elements in dense internal output accumulation workspace.
+    pub o_accum_elem_count: usize,
+}
+
+/// Raw BF16 dense decode launch parameters.
+///
+/// `q` must use FlashMLA's packed query layout `[batch, s_q * h_q / h_k, h_k, d_qk]`. `kcache`
+/// is BF16 and shaped `[num_blocks, page_block_size, h_k, d_qk]`. `out`, `lse`, `lse_accum`, and
+/// `o_accum` use the upstream dense internal layouts documented by the safe wrapper layer. Strides
+/// are element strides. The caller owns all input, output, workspace, metadata, and stream
+/// lifetimes. Launches are enqueued on `stream` and are not synchronized by this function.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct flashmla_dense_decode_params_t {
+    /// Batch size.
+    pub batch: c_int,
+    /// Query sequence length before query-head packing.
+    pub s_q: c_int,
+    /// Query head count.
+    pub h_q: c_int,
+    /// KV head count.
+    pub h_k: c_int,
+    /// Query/key head dimension.
+    pub d_qk: c_int,
+    /// Value head dimension.
+    pub d_v: c_int,
+    /// Number of KV cache pages.
+    pub num_blocks: c_int,
+    /// Tokens per KV cache page. FlashMLA dense decode currently requires `64`.
+    pub page_block_size: c_int,
+    /// Non-zero to apply causal masking. Ignored when `s_q == 1`.
+    pub is_causal: c_int,
+    /// Softmax scale applied to QK logits.
+    pub sm_scale: f32,
+
+    /// BF16 packed query pointer shaped `[batch, q_seq_per_hk, h_k, d_qk]`.
+    pub q: *const c_void,
+    /// BF16 KV cache pointer shaped `[num_blocks, page_block_size, h_k, d_qk]`.
+    pub kcache: *const c_void,
+    /// I32 KV sequence lengths shaped `[batch]`.
+    pub seqlens_k: *const c_int,
+    /// I32 block table pointer shaped `[batch, max_num_blocks_per_seq]`.
+    pub block_table: *const c_int,
+
+    /// BF16 internal output buffer shaped `[batch, h_k, q_seq_per_hk, d_v]`.
+    pub out: *mut c_void,
+    /// F32 internal LSE buffer shaped `[batch, h_k, q_seq_per_hk]`.
+    pub lse: *mut f32,
+    /// F32 split-KV LSE accumulation buffer shaped `[batch + num_sm_parts, h_k, q_seq_per_hk]`.
+    pub lse_accum: *mut f32,
+    /// F32 split-KV output accumulation buffer shaped `[batch + num_sm_parts, h_k, q_seq_per_hk, d_v]`.
+    pub o_accum: *mut f32,
+
+    /// Element stride between packed query batches.
+    pub stride_q_b: c_int,
+    /// Element stride between packed query rows.
+    pub stride_q_row: c_int,
+    /// Element stride between packed query KV heads.
+    pub stride_q_head: c_int,
+    /// Element stride between KV cache pages.
+    pub stride_k_block: c_int,
+    /// Element stride between KV cache rows.
+    pub stride_k_row: c_int,
+    /// Element stride between KV cache heads.
+    pub stride_k_head: c_int,
+    /// Element stride between block-table batches.
+    pub stride_block_table_b: c_int,
+
+    /// I32 scheduler metadata buffer generated by `flashmla_dense_decode_plan`.
+    pub tile_scheduler_metadata: *mut c_int,
+    /// I32 split-offset buffer generated by `flashmla_dense_decode_plan`.
+    pub num_splits: *mut c_int,
+    /// Number of SM partitions from the plan result.
+    pub num_sm_parts: c_int,
+
+    /// CUDA stream used for dense decode and combine launches.
+    pub stream: cudaStream_t,
+}
+
 /// Raw BF16-query and FP8-cache sparse decode launch parameters.
 ///
 /// `q`, `out`, and the final output dtype are BF16. `kv` and `extra_kv` point at FlashMLA's
@@ -304,6 +437,25 @@ unsafe extern "C" {
     pub fn flashmla_sparse_decode_bf16_fp8(
         params: *const flashmla_sparse_decode_params_t,
     ) -> flashmla_status_t;
+
+    /// Computes dense decode workspace sizes and optionally generates scheduler metadata.
+    ///
+    /// If `params.tile_scheduler_metadata` and `params.num_splits` are both null, only `result`
+    /// is populated. Otherwise both output pointers must be writable CUDA device buffers,
+    /// `params.seqlens_k` must be a valid CUDA device buffer, and the metadata kernel is enqueued
+    /// on `params.stream`.
+    pub fn flashmla_dense_decode_plan(
+        params: *const flashmla_dense_decode_plan_params_t,
+        result: *mut flashmla_dense_decode_plan_result_t,
+    ) -> flashmla_status_t;
+
+    /// Launches SM90 BF16 dense decode followed by BF16 combine.
+    ///
+    /// The caller owns all input, output, workspace, metadata, and stream lifetimes. On success
+    /// the launches are enqueued on `params.stream`; this function does not synchronize.
+    pub fn flashmla_dense_decode_bf16(
+        params: *const flashmla_dense_decode_params_t,
+    ) -> flashmla_status_t;
 }
 
 #[cfg(feature = "unsupported_arch")]
@@ -400,6 +552,12 @@ mod tests {
         assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_INVALID_ARGUMENT);
 
         let status = unsafe { flashmla_sparse_decode_bf16_fp8(std::ptr::null()) };
+        assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_INVALID_ARGUMENT);
+
+        let status = unsafe { flashmla_dense_decode_plan(std::ptr::null(), std::ptr::null_mut()) };
+        assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_INVALID_ARGUMENT);
+
+        let status = unsafe { flashmla_dense_decode_bf16(std::ptr::null()) };
         assert_eq!(status, flashmla_status_t::FLASHMLA_STATUS_INVALID_ARGUMENT);
     }
 }

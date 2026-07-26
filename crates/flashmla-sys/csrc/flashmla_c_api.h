@@ -77,6 +77,71 @@ typedef struct flashmla_sparse_decode_plan_result_t {
   size_t o_accum_elem_count;
 } flashmla_sparse_decode_plan_result_t;
 
+typedef struct flashmla_dense_decode_plan_params_t {
+  int batch;
+  int s_q;
+  int h_q;
+  int h_k;
+  int d_qk;
+  int d_v;
+
+  const int* seqlens_k;
+
+  int* tile_scheduler_metadata;
+  int* num_splits;
+
+  int num_sm;
+  flashmla_cuda_stream_t stream;
+} flashmla_dense_decode_plan_params_t;
+
+typedef struct flashmla_dense_decode_plan_result_t {
+  int num_sm_parts;
+  int fixed_overhead_num_blocks;
+  int block_size_n;
+  int q_seq_per_hk;
+  size_t scheduler_metadata_i32_len;
+  size_t num_splits_len;
+  size_t lse_accum_elem_count;
+  size_t o_accum_elem_count;
+} flashmla_dense_decode_plan_result_t;
+
+typedef struct flashmla_dense_decode_params_t {
+  int batch;
+  int s_q;
+  int h_q;
+  int h_k;
+  int d_qk;
+  int d_v;
+  int num_blocks;
+  int page_block_size;
+  int is_causal;
+  float sm_scale;
+
+  const void* q;
+  const void* kcache;
+  const int* seqlens_k;
+  const int* block_table;
+
+  void* out;
+  float* lse;
+  float* lse_accum;
+  float* o_accum;
+
+  int stride_q_b;
+  int stride_q_row;
+  int stride_q_head;
+  int stride_k_block;
+  int stride_k_row;
+  int stride_k_head;
+  int stride_block_table_b;
+
+  int* tile_scheduler_metadata;
+  int* num_splits;
+  int num_sm_parts;
+
+  flashmla_cuda_stream_t stream;
+} flashmla_dense_decode_params_t;
+
 typedef struct flashmla_sparse_decode_params_t {
   int batch;
   int s_q;
@@ -156,6 +221,15 @@ flashmla_status_t flashmla_sparse_decode_plan(
 
 flashmla_status_t flashmla_sparse_decode_bf16_fp8(
   const flashmla_sparse_decode_params_t* params
+);
+
+flashmla_status_t flashmla_dense_decode_plan(
+  const flashmla_dense_decode_plan_params_t* params,
+  flashmla_dense_decode_plan_result_t* result
+);
+
+flashmla_status_t flashmla_dense_decode_bf16(
+  const flashmla_dense_decode_params_t* params
 );
 
 #ifdef __cplusplus
