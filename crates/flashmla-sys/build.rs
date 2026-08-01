@@ -234,8 +234,70 @@ fn selected_arch() -> Result<Arch, String> {
     match env::var("CUDA_COMPUTE_CAP") {
         Ok(value) if !value.trim().is_empty() => parse_arch(value.trim(), "CUDA_COMPUTE_CAP"),
         Ok(_) => panic!("CUDA_COMPUTE_CAP is set but empty"),
-        Err(_) => Ok(Arch::Sm90a),
+        Err(env::VarError::NotPresent) => detect_arch_with_nvidia_smi(),
+        Err(env::VarError::NotUnicode(_)) => panic!("CUDA_COMPUTE_CAP is not valid Unicode"),
     }
+}
+
+fn detect_arch_with_nvidia_smi() -> Result<Arch, String> {
+    let Some(nvidia_smi) = find_program("nvidia-smi") else {
+        return Err(
+            "CUDA architecture auto-detection requires `nvidia-smi`, but it was not found in PATH. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly"
+                .to_string(),
+        );
+    };
+    let output = Command::new(&nvidia_smi)
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run {} for CUDA architecture auto-detection: {error}. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly",
+                nvidia_smi.display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} failed during CUDA architecture auto-detection with status {}: {}. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly",
+            nvidia_smi.display(),
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|error| {
+        format!(
+            "{} returned non-UTF-8 compute capability output: {error}. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly",
+            nvidia_smi.display()
+        )
+    })?;
+    parse_detected_archs(&stdout)
+}
+
+fn parse_detected_archs(output: &str) -> Result<Arch, String> {
+    let mut capabilities = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(first_capability) = capabilities.next() else {
+        return Err(
+            "nvidia-smi reported no visible GPUs during CUDA architecture auto-detection. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly"
+                .to_string(),
+        );
+    };
+    let selected = parse_arch(first_capability, "nvidia-smi compute capability")?;
+    for capability in capabilities {
+        let arch = parse_arch(capability, "nvidia-smi compute capability")?;
+        if arch != selected {
+            return Err(format!(
+                "nvidia-smi reported mixed GPU architectures ({first_capability} and {capability}), but flashmla-rs builds exactly one architecture. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly"
+            ));
+        }
+    }
+    println!(
+        "cargo:warning=auto-detected FlashMLA target {} from nvidia-smi",
+        selected.name()
+    );
+    Ok(selected)
 }
 
 fn parse_arch(value: &str, source: &str) -> Result<Arch, String> {
@@ -437,10 +499,37 @@ fn is_truthy(value: OsString) -> bool {
     )
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Arch {
     Sm90a,
     Sm100f,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arch, parse_detected_archs};
+
+    #[test]
+    fn detects_homogeneous_sm100_gpus() {
+        assert_eq!(parse_detected_archs("10.0\n10.0\n").unwrap(), Arch::Sm100f);
+    }
+
+    #[test]
+    fn detects_homogeneous_sm90_gpus() {
+        assert_eq!(parse_detected_archs("9.0\n9.0\n").unwrap(), Arch::Sm90a);
+    }
+
+    #[test]
+    fn rejects_mixed_gpu_architectures() {
+        let error = parse_detected_archs("9.0\n10.0\n").unwrap_err();
+        assert!(error.contains("mixed GPU architectures"));
+    }
+
+    #[test]
+    fn rejects_empty_gpu_query() {
+        let error = parse_detected_archs("\n").unwrap_err();
+        assert!(error.contains("no visible GPUs"));
+    }
 }
 
 impl Arch {

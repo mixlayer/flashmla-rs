@@ -26,9 +26,15 @@ git submodule update --init --recursive
 Build and test the workspace:
 
 ```bash
+cargo test --workspace
 CUDA_COMPUTE_CAP=90 cargo test --workspace
 CUDA_COMPUTE_CAP=100 cargo test --workspace
 ```
+
+When neither `CUDA_COMPUTE_CAP` nor `FLASHMLA_ARCHS` is set, the build queries all GPUs reported
+by `nvidia-smi` and selects their common compute capability. A mixed-architecture host is rejected
+because one `flashmla-sys` artifact contains exactly one architecture. CI, cross-compilation, and
+container builds without a visible GPU should continue to set the target explicitly.
 
 Run the GPU smoke tests explicitly on the matching architecture:
 
