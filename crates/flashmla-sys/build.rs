@@ -6,9 +6,12 @@ use std::{
     process::Command,
 };
 
-const UPSTREAM_SM90_SOURCES: &[&str] = &[
+const COMMON_DECODE_SOURCES: &[&str] = &[
     "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/smxx/decode/combine/combine.cu",
+];
+
+const SM90_SOURCES: &[&str] = &[
     "csrc/sm90/prefill/sparse/fwd.cu",
     "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
     "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
@@ -18,6 +21,17 @@ const UPSTREAM_SM90_SOURCES: &[&str] = &[
     "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
     "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
     "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+];
+
+const SM100_SOURCES: &[&str] = &[
+    "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
+    "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
+    "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+    "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+    "csrc/sm100/decode/head64/instantiations/v32.cu",
+    "csrc/sm100/decode/head64/instantiations/model1.cu",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
 ];
 
 fn main() {
@@ -59,7 +73,7 @@ fn main() {
     let nvcc = cuda_root.join("bin").join("nvcc");
     let ar = find_program("ar").unwrap_or_else(|| PathBuf::from("ar"));
 
-    for source in UPSTREAM_SM90_SOURCES {
+    for source in COMMON_DECODE_SOURCES.iter().chain(arch.sources()) {
         println!(
             "cargo:rerun-if-changed={}",
             flashmla_root.join(source).display()
@@ -71,7 +85,7 @@ fn main() {
     );
     println!("cargo:metadata=source_root={}", flashmla_root.display());
 
-    let sources = selected_sources(&manifest_dir, &flashmla_root);
+    let sources = selected_sources(&manifest_dir, &flashmla_root, arch);
     for source in &sources {
         require_file(source);
     }
@@ -84,7 +98,7 @@ fn main() {
         )
     });
 
-    let include_dirs = include_dirs(&manifest_dir, &flashmla_root, &cuda_root);
+    let include_dirs = include_dirs(&manifest_dir, &flashmla_root, &cuda_root, &arch);
     let mut objects = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
         let object = build_dir.join(format!("{index:02}_{}.o", object_stem(source)));
@@ -211,7 +225,7 @@ fn selected_arch() -> Result<Arch, String> {
             .collect();
         if parsed.len() != 1 {
             panic!(
-                "FLASHMLA_ARCHS={archs:?} is not supported yet. Phase 2 only supports a single sm90a build."
+                "FLASHMLA_ARCHS={archs:?} is not supported yet. Use exactly one of sm90a or sm100f."
             );
         }
         return parse_arch(parsed[0], "FLASHMLA_ARCHS");
@@ -234,35 +248,39 @@ fn parse_arch(value: &str, source: &str) -> Result<Arch, String> {
 
     match normalized.as_str() {
         "90" | "90a" | "sm90" | "sm90a" | "compute90a" => Ok(Arch::Sm90a),
-        "100" | "100f" | "sm100" | "sm100f" | "compute100f" => Err(format!(
-            "{source}={value:?} requested SM100, but bindings are not implemented by this crate yet"
-        )),
+        "100" | "100f" | "sm100" | "sm100f" | "compute100f" => Ok(Arch::Sm100f),
         "120" | "121" | "sm120" | "sm121" => Err(format!(
             "{source}={value:?} is unsupported by upstream FlashMLA sparse MLA"
         )),
         _ => Err(format!(
-            "{source}={value:?} is unsupported. Use CUDA_COMPUTE_CAP=90 or FLASHMLA_ARCHS=sm90a"
+            "{source}={value:?} is unsupported. Use CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f"
         )),
     }
 }
 
-fn selected_sources(manifest_dir: &Path, flashmla_root: &Path) -> Vec<PathBuf> {
-    let mut sources = Vec::with_capacity(UPSTREAM_SM90_SOURCES.len() + 1);
+fn selected_sources(manifest_dir: &Path, flashmla_root: &Path, arch: Arch) -> Vec<PathBuf> {
+    let mut sources = Vec::with_capacity(COMMON_DECODE_SOURCES.len() + arch.sources().len() + 1);
     sources.push(manifest_dir.join("csrc").join("flashmla_c_api.cu"));
     sources.extend(
-        UPSTREAM_SM90_SOURCES
+        COMMON_DECODE_SOURCES
             .iter()
+            .chain(arch.sources())
             .map(|source| flashmla_root.join(source)),
     );
     sources
 }
 
-fn include_dirs(manifest_dir: &Path, flashmla_root: &Path, cuda_root: &Path) -> Vec<PathBuf> {
+fn include_dirs(
+    manifest_dir: &Path,
+    flashmla_root: &Path,
+    cuda_root: &Path,
+    arch: &Arch,
+) -> Vec<PathBuf> {
     vec![
         manifest_dir.join("csrc"),
         flashmla_root.join("csrc"),
         flashmla_root.join("csrc").join("kerutils").join("include"),
-        flashmla_root.join("csrc").join("sm90"),
+        flashmla_root.join("csrc").join(arch.source_dir()),
         flashmla_root.join("csrc").join("cutlass").join("include"),
         flashmla_root
             .join("csrc")
@@ -311,6 +329,7 @@ fn compile_cuda_source(
         "-Xcompiler=-fvisibility=hidden",
     ]);
     command.arg("-gencode").arg(arch.gencode());
+    command.arg(arch.target_define());
     if env_truthy("FLASHMLA_PTXAS_VERBOSE") {
         command.arg("--ptxas-options=-v");
     }
@@ -421,18 +440,42 @@ fn is_truthy(value: OsString) -> bool {
 #[derive(Debug, Copy, Clone)]
 enum Arch {
     Sm90a,
+    Sm100f,
 }
 
 impl Arch {
     fn name(self) -> &'static str {
         match self {
             Self::Sm90a => "sm90a",
+            Self::Sm100f => "sm100f",
+        }
+    }
+
+    fn source_dir(self) -> &'static str {
+        match self {
+            Self::Sm90a => "sm90",
+            Self::Sm100f => "sm100",
+        }
+    }
+
+    fn sources(self) -> &'static [&'static str] {
+        match self {
+            Self::Sm90a => SM90_SOURCES,
+            Self::Sm100f => SM100_SOURCES,
         }
     }
 
     fn gencode(self) -> &'static str {
         match self {
             Self::Sm90a => "arch=compute_90a,code=sm_90a",
+            Self::Sm100f => "arch=compute_100f,code=sm_100f",
+        }
+    }
+
+    fn target_define(self) -> &'static str {
+        match self {
+            Self::Sm90a => "-DFLASHMLA_TARGET_SM90=1",
+            Self::Sm100f => "-DFLASHMLA_TARGET_SM100=1",
         }
     }
 }

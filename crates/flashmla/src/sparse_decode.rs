@@ -6,7 +6,10 @@ use flashmla_sys::{
     flashmla_sparse_decode_plan_params_t, flashmla_sparse_decode_plan_result_t, flashmla_status_t,
 };
 
-use crate::{Error, Result};
+use crate::{Arch, Error, Result};
+
+const DECODE_SCHED_META_I32_PER_PART: usize = 8;
+const DECODE_MAX_NUM_SM_PARTS_FOR_COMBINE: usize = 160;
 
 /// Runtime options for sparse decode.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -97,7 +100,7 @@ impl SparseDecodeDims {
         }
         if self.topk % 64 != 0 {
             return Err(Error::InvalidArgument(format!(
-                "SM90 sparse decode requires topk to be a multiple of 64, got {}",
+                "sparse decode requires topk to be a multiple of 64, got {}",
                 self.topk
             )));
         }
@@ -133,6 +136,77 @@ impl SparseDecodeDims {
     /// Returns true when optional extra KV-cache tensors are part of the decode launch.
     pub fn has_extra_cache(self) -> bool {
         self.extra_num_blocks != 0 || self.extra_page_block_size != 0 || self.extra_topk != 0
+    }
+
+    /// Computes architecture-specific sparse decode scheduler and workspace sizing.
+    pub fn plan_for_arch(self, arch: Arch, num_sm: usize) -> Result<SparseDecodePlanMeta> {
+        self.validate()?;
+        if num_sm == 0 {
+            return Err(Error::InvalidArgument(
+                "num_sm must be non-zero".to_string(),
+            ));
+        }
+
+        let num_sm_parts = match arch {
+            Arch::Sm90a => num_sm / self.s_q / (self.h_q / 64),
+            Arch::Sm100f if self.h_q == 128 && self.d_qk == 512 => num_sm / self.s_q / 2,
+            Arch::Sm100f => num_sm / self.s_q,
+        }
+        .max(1);
+        if num_sm_parts > DECODE_MAX_NUM_SM_PARTS_FOR_COMBINE {
+            return Err(Error::InvalidArgument(format!(
+                "computed num_sm_parts ({num_sm_parts}) exceeds the combine kernel maximum ({DECODE_MAX_NUM_SM_PARTS_FOR_COMBINE})"
+            )));
+        }
+
+        let fixed_overhead_num_blocks =
+            if arch == Arch::Sm100f && self.h_q == 128 && self.d_qk == 512 {
+                3
+            } else {
+                5
+            };
+        let scheduler_metadata_i32_len = num_sm_parts
+            .checked_mul(DECODE_SCHED_META_I32_PER_PART)
+            .ok_or_else(|| {
+            Error::InvalidArgument("scheduler metadata element count overflow".to_string())
+        })?;
+        let num_splits_len = self
+            .batch
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidArgument("num_splits length overflow".to_string()))?;
+
+        let (lse_accum_elem_count, o_accum_elem_count) = if num_sm_parts == 1 {
+            (1, 1)
+        } else {
+            let total_splits = self.batch.checked_add(num_sm_parts).ok_or_else(|| {
+                Error::InvalidArgument("total decode split count overflow".to_string())
+            })?;
+            let lse_accum_elem_count = total_splits
+                .checked_mul(self.s_q)
+                .and_then(|count| count.checked_mul(self.h_q))
+                .ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "sparse decode LSE workspace element count overflow".to_string(),
+                    )
+                })?;
+            let o_accum_elem_count =
+                lse_accum_elem_count.checked_mul(self.d_v).ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "sparse decode output workspace element count overflow".to_string(),
+                    )
+                })?;
+            (lse_accum_elem_count, o_accum_elem_count)
+        };
+
+        Ok(SparseDecodePlanMeta {
+            num_sm_parts,
+            fixed_overhead_num_blocks,
+            block_size_topk: 64,
+            scheduler_metadata_i32_len,
+            num_splits_len,
+            lse_accum_elem_count,
+            o_accum_elem_count,
+        })
     }
 }
 
@@ -256,7 +330,8 @@ pub struct SparseDecodeStrides {
     pub q_s_q: usize,
     /// Element stride between query heads.
     pub q_h_q: usize,
-    /// Byte stride between packed KV cache pages.
+    /// Byte stride between packed KV cache pages. SM100 requires a multiple of `656` for V32
+    /// or `576` for MODEL1, so MODEL1 cache blocks may need padding.
     pub kv_block: usize,
     /// Byte stride between packed KV cache rows.
     pub kv_row: usize,
@@ -274,7 +349,8 @@ pub struct SparseDecodeStrides {
     pub out_s_q: usize,
     /// Element stride between output heads.
     pub out_h_q: usize,
-    /// Byte stride between optional extra KV cache pages.
+    /// Byte stride between optional extra KV cache pages, with the same SM100 alignment as
+    /// `kv_block`.
     pub extra_kv_block: usize,
     /// Byte stride between optional extra KV cache rows.
     pub extra_kv_row: usize,
@@ -526,7 +602,7 @@ pub unsafe fn sparse_decode_plan(params: &SparseDecodePlanParams) -> Result<Spar
     }
 }
 
-/// Launches SM90 sparse decode and combine through `flashmla-sys`.
+/// Launches the compiled SM90 or SM100 sparse decode and combine through `flashmla-sys`.
 ///
 /// # Safety
 ///
@@ -575,6 +651,23 @@ fn checked_optional_stride(value: usize, name: &str, required: bool) -> Result<i
 mod tests {
     use super::*;
 
+    fn dims(h_q: usize, d_qk: usize, s_q: usize) -> SparseDecodeDims {
+        SparseDecodeDims {
+            batch: 2,
+            s_q,
+            h_q,
+            h_kv: 1,
+            d_qk,
+            d_v: 512,
+            num_blocks: 2,
+            page_block_size: 64,
+            topk: 64,
+            extra_num_blocks: 0,
+            extra_page_block_size: 0,
+            extra_topk: 0,
+        }
+    }
+
     #[test]
     fn validates_supported_shape() {
         SparseDecodeDims {
@@ -612,5 +705,35 @@ mod tests {
             extra_topk: 64,
         };
         assert!(matches!(dims.validate(), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn sm100_model1_head128_uses_half_partitions_and_lower_overhead() {
+        let meta = dims(128, 512, 2).plan_for_arch(Arch::Sm100f, 160).unwrap();
+        assert_eq!(meta.num_sm_parts, 40);
+        assert_eq!(meta.fixed_overhead_num_blocks, 3);
+        assert_eq!(meta.block_size_topk, 64);
+        assert_eq!(meta.scheduler_metadata_i32_len, 40 * 8);
+        assert_eq!(meta.num_splits_len, 3);
+        assert_eq!(meta.lse_accum_elem_count, (2 + 40) * 2 * 128);
+        assert_eq!(meta.o_accum_elem_count, (2 + 40) * 2 * 128 * 512);
+    }
+
+    #[test]
+    fn sm100_other_shapes_use_full_partitions_and_overhead_five() {
+        let meta = dims(128, 576, 2).plan_for_arch(Arch::Sm100f, 160).unwrap();
+        assert_eq!(meta.num_sm_parts, 80);
+        assert_eq!(meta.fixed_overhead_num_blocks, 5);
+    }
+
+    #[test]
+    fn sm100_no_split_plan_uses_scalar_workspaces() {
+        let meta = dims(128, 512, 160)
+            .plan_for_arch(Arch::Sm100f, 160)
+            .unwrap();
+        assert_eq!(meta.num_sm_parts, 1);
+        assert_eq!(meta.fixed_overhead_num_blocks, 3);
+        assert_eq!(meta.lse_accum_elem_count, 1);
+        assert_eq!(meta.o_accum_elem_count, 1);
     }
 }

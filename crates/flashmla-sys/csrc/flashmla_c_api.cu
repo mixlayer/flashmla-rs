@@ -4,13 +4,23 @@
 #include <cutlass/bfloat16.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <string>
 
 #include "params.h"
+#if defined(FLASHMLA_TARGET_SM100)
+#include "sm100/decode/head64/kernel.h"
+#include "sm100/prefill/sparse/fwd/head64/phase1.h"
+#include "sm100/prefill/sparse/fwd/head128/phase1.h"
+#include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#elif defined(FLASHMLA_TARGET_SM90)
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm90/prefill/sparse/fwd.h"
+#else
+#error "FlashMLA target architecture is not defined"
+#endif
 #include "smxx/decode/combine/combine.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 
@@ -21,6 +31,7 @@ constexpr int kDecodeSchedMetaI32Len = sizeof(DecodingSchedMeta) / sizeof(int);
 constexpr int kDecodeMaxNumSmPartsForCombine = 160;
 
 thread_local std::string g_last_error;
+thread_local int g_validated_device = -1;
 
 flashmla_status_t set_error(flashmla_status_t status, const std::string& message) {
   g_last_error = message;
@@ -79,11 +90,14 @@ int sparse_decode_bytes_per_token(int d_qk, int d_v) {
   return -1;
 }
 
-flashmla_status_t validate_current_device_sm90(const char* context) {
+flashmla_status_t validate_current_device() {
   int current_device = 0;
   cudaError_t error = cudaGetDevice(&current_device);
   if (error != cudaSuccess) {
     return set_cuda_error("cudaGetDevice failed", error);
+  }
+  if (current_device == g_validated_device) {
+    return FLASHMLA_STATUS_SUCCESS;
   }
 
   cudaDeviceProp props;
@@ -91,9 +105,24 @@ flashmla_status_t validate_current_device_sm90(const char* context) {
   if (error != cudaSuccess) {
     return set_cuda_error("cudaGetDeviceProperties failed", error);
   }
-  if (props.major != 9 || props.minor != 0) {
-    return set_error(FLASHMLA_STATUS_UNSUPPORTED_ARCH, context);
+#if defined(FLASHMLA_TARGET_SM100)
+  constexpr int target_major = 10;
+  constexpr int target_minor = 0;
+  constexpr const char* target_name = "SM100f";
+#else
+  constexpr int target_major = 9;
+  constexpr int target_minor = 0;
+  constexpr const char* target_name = "SM90a";
+#endif
+  if (props.major != target_major || props.minor != target_minor) {
+    return set_error(
+      FLASHMLA_STATUS_UNSUPPORTED_ARCH,
+      std::string("FlashMLA library was built for ") + target_name +
+        ", but the current device has compute capability " +
+        std::to_string(props.major) + "." + std::to_string(props.minor)
+    );
   }
+  g_validated_device = current_device;
 
   return FLASHMLA_STATUS_SUCCESS;
 }
@@ -119,7 +148,7 @@ flashmla_status_t validate_sparse_prefill_params(
   if (params->h_q != 64 && params->h_q != 128) {
     return set_error(
       FLASHMLA_STATUS_INVALID_ARGUMENT,
-      "h_q must be padded to 64 or 128 for SM90 sparse prefill"
+      "h_q must be padded to 64 or 128 for sparse prefill"
     );
   }
   if (params->h_kv != 1) {
@@ -137,10 +166,20 @@ flashmla_status_t validate_sparse_prefill_params(
   if (params->d_v != 512) {
     return set_error(FLASHMLA_STATUS_INVALID_ARGUMENT, "d_v must be 512");
   }
-  if (params->topk % 128 != 0) {
+#if defined(FLASHMLA_TARGET_SM100)
+  const int topk_alignment =
+    params->h_q == 64 ||
+        (params->h_q == 128 && params->d_qk == 512 && params->topk <= 1280)
+      ? 64
+      : 128;
+#else
+  const int topk_alignment = 128;
+#endif
+  if (params->topk % topk_alignment != 0) {
     return set_error(
       FLASHMLA_STATUS_INVALID_ARGUMENT,
-      "SM90 sparse prefill requires topk to be a positive multiple of 128"
+      std::string("sparse prefill topk must be a multiple of ") +
+        std::to_string(topk_alignment) + " for the selected kernel"
     );
   }
   if (params->num_sm <= 0) {
@@ -155,7 +194,7 @@ flashmla_status_t validate_sparse_prefill_params(
     );
   }
 
-  return validate_current_device_sm90("sparse prefill wrapper only supports SM90");
+  return validate_current_device();
 }
 
 flashmla_status_t validate_sparse_decode_shape(
@@ -179,7 +218,7 @@ flashmla_status_t validate_sparse_decode_shape(
   if (h_q != 64 && h_q != 128) {
     return set_error(
       FLASHMLA_STATUS_INVALID_ARGUMENT,
-      "h_q must be padded to 64 or 128 for SM90 sparse decode"
+      "h_q must be padded to 64 or 128 for sparse decode"
     );
   }
   if (h_kv != 1) {
@@ -200,7 +239,7 @@ flashmla_status_t validate_sparse_decode_shape(
   if (topk % 64 != 0) {
     return set_error(
       FLASHMLA_STATUS_INVALID_ARGUMENT,
-      "SM90 sparse decode requires topk to be a multiple of 64"
+      "sparse decode topk must be a multiple of 64"
     );
   }
   if (d_qk == 576) {
@@ -230,6 +269,7 @@ flashmla_status_t fill_sparse_decode_plan_result(
   int batch,
   int s_q,
   int h_q,
+  int d_qk,
   int d_v,
   int num_sm,
   flashmla_sparse_decode_plan_result_t* result
@@ -238,9 +278,16 @@ flashmla_status_t fill_sparse_decode_plan_result(
     return set_error(FLASHMLA_STATUS_INVALID_ARGUMENT, "num_sm must be positive");
   }
 
-  const int head_factor = h_q / 64;
-  const int denom = s_q * head_factor;
-  const int num_sm_parts = std::max(num_sm / denom, 1);
+#if defined(FLASHMLA_TARGET_SM100)
+  const bool use_head128_model1 = h_q == 128 && d_qk == 512;
+  const int num_sm_parts = use_head128_model1
+    ? std::max(num_sm / s_q / 2, 1)
+    : std::max(num_sm / s_q, 1);
+  const int fixed_overhead_num_blocks = use_head128_model1 ? 3 : 5;
+#else
+  const int num_sm_parts = std::max(num_sm / s_q / (h_q / 64), 1);
+  const int fixed_overhead_num_blocks = 5;
+#endif
   if (num_sm_parts > kDecodeMaxNumSmPartsForCombine) {
     return set_error(
       FLASHMLA_STATUS_INVALID_ARGUMENT,
@@ -266,7 +313,7 @@ flashmla_status_t fill_sparse_decode_plan_result(
   }
 
   result->num_sm_parts = num_sm_parts;
-  result->fixed_overhead_num_blocks = 5;
+  result->fixed_overhead_num_blocks = fixed_overhead_num_blocks;
   result->block_size_topk = 64;
   result->scheduler_metadata_i32_len =
     static_cast<size_t>(num_sm_parts) * static_cast<size_t>(kDecodeSchedMetaI32Len);
@@ -313,6 +360,7 @@ flashmla_status_t validate_sparse_decode_plan_params(
     params->batch,
     params->s_q,
     params->h_q,
+    params->d_qk,
     params->d_v,
     params->num_sm,
     result
@@ -321,7 +369,7 @@ flashmla_status_t validate_sparse_decode_plan_params(
     return status;
   }
 
-  return validate_current_device_sm90("sparse decode wrapper only supports SM90");
+  return validate_current_device();
 }
 
 flashmla_status_t validate_sparse_decode_params(
@@ -396,6 +444,22 @@ flashmla_status_t validate_sparse_decode_params(
       "kv page rows must be contiguous and match the FlashMLA bytes-per-token layout"
     );
   }
+#if defined(FLASHMLA_TARGET_SM100)
+  const int tma_k_stride = params->d_qk == 576 ? 656 : 576;
+  if (params->stride_kv_block % tma_k_stride != 0) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      std::string("SM100 kv block stride must be a multiple of ") +
+        std::to_string(tma_k_stride) + "; pad each cache block as needed"
+    );
+  }
+  if (reinterpret_cast<uintptr_t>(params->kv) % 16 != 0) {
+    return set_error(
+      FLASHMLA_STATUS_INVALID_ARGUMENT,
+      "SM100 kv cache base pointer must be 16-byte aligned"
+    );
+  }
+#endif
 
   if (has_extra) {
     if (params->extra_num_blocks <= 0 || params->extra_page_block_size <= 0 ||
@@ -419,9 +483,24 @@ flashmla_status_t validate_sparse_decode_params(
         "extra kv page rows must be contiguous and match the FlashMLA bytes-per-token layout"
       );
     }
+#if defined(FLASHMLA_TARGET_SM100)
+    if (params->stride_extra_kv_block % tma_k_stride != 0) {
+      return set_error(
+        FLASHMLA_STATUS_INVALID_ARGUMENT,
+        std::string("SM100 extra kv block stride must be a multiple of ") +
+          std::to_string(tma_k_stride) + "; pad each cache block as needed"
+      );
+    }
+    if (reinterpret_cast<uintptr_t>(params->extra_kv) % 16 != 0) {
+      return set_error(
+        FLASHMLA_STATUS_INVALID_ARGUMENT,
+        "SM100 extra kv cache base pointer must be 16-byte aligned"
+      );
+    }
+#endif
   }
 
-  return validate_current_device_sm90("sparse decode wrapper only supports SM90");
+  return validate_current_device();
 }
 
 }  // namespace
@@ -499,7 +578,26 @@ flashmla_status_t flashmla_sparse_prefill_bf16(
       reinterpret_cast<cudaStream_t>(params->stream)
     };
 
+#if defined(FLASHMLA_TARGET_SM100)
+    if (params->h_q == 64) {
+      if (params->d_qk == 512) {
+        sm100::fwd::head64::run_fwd_phase1_kernel<512>(upstream_params);
+      } else {
+        sm100::fwd::head64::run_fwd_phase1_kernel<576>(upstream_params);
+      }
+    } else if (params->d_qk == 512 && params->topk <= 1280) {
+      sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<
+        SparseAttnFwdMode::Prefill,
+        512
+      >(upstream_params);
+    } else if (params->d_qk == 512) {
+      sm100::fwd::head128::run_fwd_phase1_kernel<512>(upstream_params);
+    } else {
+      sm100::fwd::head128::run_fwd_phase1_kernel<576>(upstream_params);
+    }
+#else
     sm90::run_fwd_kernel(upstream_params);
+#endif
   } catch (const std::exception& error) {
     return set_error(FLASHMLA_STATUS_INTERNAL_ERROR, error.what());
   } catch (...) {
@@ -634,6 +732,40 @@ flashmla_status_t flashmla_sparse_decode_bf16_fp8(
       params->num_sm_parts
     };
 
+#if defined(FLASHMLA_TARGET_SM100)
+    if (params->h_q == 64) {
+      if (model_type == ModelType::V32) {
+        sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<
+          ModelType::V32
+        >(upstream_params);
+      } else {
+        sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<
+          ModelType::MODEL1
+        >(upstream_params);
+      }
+    } else if (model_type == ModelType::V32) {
+      for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
+        SparseAttnDecodeParams current = upstream_params;
+        current.q += start_head_idx * params->stride_q_h_q;
+        if (current.attn_sink != nullptr) {
+          current.attn_sink += start_head_idx;
+        }
+        current.lse += start_head_idx;
+        current.out += start_head_idx * params->stride_o_h_q;
+        current.lse_accum += start_head_idx;
+        current.o_accum += start_head_idx * params->stride_o_accum_h_q;
+        current.h_q = 64;
+        sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<
+          ModelType::V32
+        >(current);
+      }
+    } else {
+      sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<
+        SparseAttnFwdMode::DecodeWithSplitKV,
+        512
+      >(upstream_params);
+    }
+#else
     if (model_type == ModelType::V32) {
       if (params->h_q == 64) {
         sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64>(
@@ -655,6 +787,7 @@ flashmla_status_t flashmla_sparse_decode_bf16_fp8(
         );
       }
     }
+#endif
 
     // Preserve upstream's PDL combine launch even for one-part schedules. Its
     // CTAs return without touching the scalar accumulators, while retaining

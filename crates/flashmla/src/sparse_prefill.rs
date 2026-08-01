@@ -5,7 +5,7 @@ use flashmla_sys::{
     flashmla_sparse_prefill_params_t, flashmla_status_t,
 };
 
-use crate::{Error, Result};
+use crate::{Arch, Error, Result};
 
 /// Runtime options for sparse prefill.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -82,11 +82,22 @@ impl SparsePrefillDims {
         Ok(())
     }
 
-    fn validate_sm90(self) -> Result<()> {
+    /// Validates sparse prefill shape and top-k alignment for a target architecture.
+    pub fn validate_for_arch(self, arch: Arch) -> Result<()> {
         self.validate()?;
-        if self.topk % 128 != 0 {
+        let alignment = match arch {
+            Arch::Sm90a => 128,
+            Arch::Sm100f
+                if self.h_q == 64 || (self.h_q == 128 && self.d_qk == 512 && self.topk <= 1280) =>
+            {
+                64
+            }
+            Arch::Sm100f => 128,
+        };
+        if self.topk % alignment != 0 {
             return Err(Error::InvalidArgument(format!(
-                "SM90 sparse prefill requires topk to be a multiple of 128, got {}",
+                "{} sparse prefill requires topk to be a multiple of {alignment}, got {}",
+                arch.nvcc_arch(),
                 self.topk
             )));
         }
@@ -157,7 +168,7 @@ pub struct SparsePrefillLaunchParams {
 
 impl SparsePrefillLaunchParams {
     fn validate(self) -> Result<()> {
-        self.dims.validate_sm90()?;
+        self.dims.validate()?;
         self.strides.validate()?;
         if self.config.d_v != self.dims.d_v {
             return Err(Error::InvalidArgument(format!(
@@ -215,7 +226,7 @@ impl SparsePrefillLaunchParams {
     }
 }
 
-/// Launches the SM90 BF16 sparse prefill kernel through `flashmla-sys`.
+/// Launches the compiled SM90 or SM100 BF16 sparse prefill kernel through `flashmla-sys`.
 ///
 /// # Safety
 ///
@@ -264,20 +275,56 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn sm90_validation_rejects_non_multiple_topk() {
-        let dims = SparsePrefillDims {
+    fn dims(h_q: usize, d_qk: usize, topk: usize) -> SparsePrefillDims {
+        SparsePrefillDims {
             s_q: 16,
-            s_kv: 128,
-            h_q: 64,
+            s_kv: 2048,
+            h_q,
             h_kv: 1,
-            d_qk: 576,
+            d_qk,
             d_v: 512,
-            topk: 32,
-        };
+            topk,
+        }
+    }
+
+    #[test]
+    fn sm90_prefill_alignment() {
         assert!(matches!(
-            dims.validate_sm90(),
+            dims(64, 576, 64).validate_for_arch(Arch::Sm90a),
             Err(Error::InvalidArgument(_))
         ));
+        dims(64, 576, 128).validate_for_arch(Arch::Sm90a).unwrap();
+    }
+
+    #[test]
+    fn sm100_head64_accepts_64_aligned_topk() {
+        dims(64, 576, 64).validate_for_arch(Arch::Sm100f).unwrap();
+    }
+
+    #[test]
+    fn sm100_head128_model1_small_topk_accepts_64_alignment() {
+        dims(128, 512, 1216)
+            .validate_for_arch(Arch::Sm100f)
+            .unwrap();
+    }
+
+    #[test]
+    fn sm100_head128_v32_requires_128_alignment() {
+        assert!(matches!(
+            dims(128, 576, 64).validate_for_arch(Arch::Sm100f),
+            Err(Error::InvalidArgument(_))
+        ));
+        dims(128, 576, 128).validate_for_arch(Arch::Sm100f).unwrap();
+    }
+
+    #[test]
+    fn sm100_head128_model1_large_topk_requires_128_alignment() {
+        assert!(matches!(
+            dims(128, 512, 1344).validate_for_arch(Arch::Sm100f),
+            Err(Error::InvalidArgument(_))
+        ));
+        dims(128, 512, 1408)
+            .validate_for_arch(Arch::Sm100f)
+            .unwrap();
     }
 }
