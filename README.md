@@ -7,7 +7,8 @@ prefill and decode without depending on libtorch, pybind11, or Python extension 
 
 - Rust with Cargo, edition 2024 support.
 - NVIDIA CUDA Toolkit with `nvcc` available through `CUDA_HOME`, `CUDA_ROOT`, `CUDA_PATH`, or `PATH`.
-- An SM90 CUDA GPU for the implemented smoke-tested kernels.
+- An SM90/Hopper or SM100/Blackwell datacenter GPU for kernel execution.
+- CUDA 12.8 or newer for SM90; the upstream `sm_100f` sources require CUDA 12.9 or newer.
 - Git submodules initialized, including FlashMLA's nested CUTLASS submodule.
 - Linux build environment with a C++20-capable host compiler, `ar`, and CUDA driver/runtime
   libraries.
@@ -25,13 +26,24 @@ git submodule update --init --recursive
 Build and test the workspace:
 
 ```bash
+cargo test --workspace
 CUDA_COMPUTE_CAP=90 cargo test --workspace
+CUDA_COMPUTE_CAP=100 cargo test --workspace
 ```
 
-Run the SM90 GPU smoke tests explicitly:
+When neither `CUDA_COMPUTE_CAP` nor `FLASHMLA_ARCHS` is set, the build queries all GPUs reported
+by `nvidia-smi` and selects their common compute capability. A mixed-architecture host is rejected
+because one `flashmla-sys` artifact contains exactly one architecture. CI, cross-compilation, and
+container builds without a visible GPU should continue to set the target explicitly.
+
+Run the GPU smoke tests explicitly on the matching architecture:
 
 ```bash
 CUDA_COMPUTE_CAP=90 cargo test -p candle-flashmla -- --ignored --nocapture
+CUDA_COMPUTE_CAP=100 cargo test -p candle-flashmla \
+  sparse_prefill_sm100_smoke -- --ignored --nocapture
+CUDA_COMPUTE_CAP=100 cargo test -p candle-flashmla \
+  sparse_decode_sm100_smoke -- --ignored --nocapture
 ```
 
 Run only one smoke test:
@@ -44,12 +56,13 @@ CUDA_COMPUTE_CAP=90 cargo test -p candle-flashmla sparse_decode_sm90_smoke -- --
 Use an external FlashMLA checkout instead of the vendored submodule:
 
 ```bash
-FLASHMLA_ROOT=/path/to/FlashMLA CUDA_COMPUTE_CAP=90 cargo test --workspace
+FLASHMLA_ROOT=/path/to/FlashMLA CUDA_COMPUTE_CAP=100 cargo test --workspace
 ```
 
 Useful build variables:
 
-- `CUDA_COMPUTE_CAP=90`: selects the current SM90 build path.
+- `CUDA_COMPUTE_CAP=90` or `100`: deterministically selects the SM90a or SM100f build path.
+- `FLASHMLA_ARCHS=sm90a` or `sm100f`: equivalent explicit single-architecture selection.
 - `FLASHMLA_ROOT=/path/to/FlashMLA`: overrides the vendored submodule.
 - `FLASHMLA_BUILD_DIR=/path/to/cache`: controls where CUDA object files and the static archive are
   written.
@@ -108,8 +121,8 @@ Status values:
 
 | Kernel | SM90 / Hopper | SM100 / Blackwell | SM120 / SM121 |
 | --- | --- | --- | --- |
-| Sparse BF16 prefill | Done: C ABI, Rust wrapper, Candle API, smoke test | Planned: upstream sources identified, dispatch/build not wired | Unsupported |
-| Sparse BF16-query / FP8-cache decode | Done: C ABI, Rust wrapper, Candle plan/run API, smoke test | Planned: upstream sources identified, dispatch/build not wired | Unsupported |
+| Sparse BF16 prefill | Done: C ABI, Rust wrapper, Candle API, smoke test | Done: architecture-specific dispatch, validation, and B200 smoke test | Unsupported |
+| Sparse BF16-query / FP8-cache decode | Done: C ABI, Rust wrapper, Candle plan/run API, smoke test | Done: both planning branches, decode dispatch, combine, and graph-capture B200 smoke test | Unsupported |
 | Dense prefill | Planned | Planned | Unsupported |
 | Dense decode | Planned | Planned | Unsupported |
 
@@ -123,5 +136,8 @@ Status values:
   not synchronize.
 - Sparse decode uses explicit caller-owned scheduler metadata, `num_splits`, `lse_accum`, and
   `o_accum` buffers allocated by the Candle integration layer.
-- SM100 support should be added by making the build source set and runtime C ABI dispatch
-  architecture-aware before adding the SM100 kernel calls.
+- SM100 V32 cache blocks use a byte pitch divisible by 656. MODEL1 keeps its 584-byte logical row
+  layout but each cache block must be padded so the block pitch is divisible by the upstream TMA
+  stride of 576 bytes.
+- SM90a and SM100f are separate compile-time targets. The C ABI rejects a current device whose
+  exact compute capability does not match the compiled target before launching a kernel.
