@@ -96,15 +96,12 @@ pub fn sparse_prefill(
     let device = get_device_info(device_id)?;
     dims.validate_for_arch(device.arch)?;
 
-    // SAFETY: The FlashMLA prefill kernel fully overwrites `out`, `max_logits`, and `lse`
-    // for every query/head element before these tensors are returned.
-    let (out, max_logits, lse) = unsafe {
-        (
-            Tensor::empty((s_q, h_q, config.d_v), DType::BF16, q.device())?,
-            Tensor::empty((s_q, h_q), DType::F32, q.device())?,
-            Tensor::empty((s_q, h_q), DType::F32, q.device())?,
-        )
-    };
+    // Deliberately zero outputs for correctness diagnostics. FlashMLA is expected to overwrite
+    // every element, so retained zeroes identify incomplete kernel coverage without exposing
+    // allocator contents.
+    let out = Tensor::zeros((s_q, h_q, config.d_v), DType::BF16, q.device())?;
+    let max_logits = Tensor::zeros((s_q, h_q), DType::F32, q.device())?;
+    let lse = Tensor::zeros((s_q, h_q), DType::F32, q.device())?;
 
     let q_stride = q.stride();
     let kv_stride = kv.stride();

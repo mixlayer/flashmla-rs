@@ -2,7 +2,12 @@
 
 pub use flashmla::{SparseDecodeConfig, SparseDecodeDims, SparseDecodePlanMeta};
 
-use candle::{DType, Tensor};
+use std::sync::Arc;
+
+use candle::{
+    DType, Tensor,
+    cuda::cudarc::driver::{CudaStream, result::memset_d8_async},
+};
 use flashmla::{
     Arch, SparseDecodeLaunchParams, SparseDecodePlanParams, SparseDecodeStrides, get_device_info,
     sparse_decode_bf16_fp8, sparse_decode_plan as flashmla_sparse_decode_plan,
@@ -120,21 +125,16 @@ pub fn sparse_decode_plan(
     let metadata_i32_per_part = meta.scheduler_metadata_i32_len / meta.num_sm_parts;
     let (lse_accum_shape, o_accum_shape) = decode_workspace_shapes(meta, dims)?;
 
-    // SAFETY: The second planning call writes all scheduler metadata and split offsets. Decode
-    // writes every accumulator element that combine can read; scalar no-split accumulators are
-    // required to be non-null but are never accessed.
-    let (scheduler_metadata, num_splits, lse_accum, o_accum) = unsafe {
-        (
-            Tensor::empty(
-                (meta.num_sm_parts, metadata_i32_per_part),
-                DType::I32,
-                q.device(),
-            )?,
-            Tensor::empty((meta.num_splits_len,), DType::I32, q.device())?,
-            Tensor::empty(lse_accum_shape, DType::F32, q.device())?,
-            Tensor::empty(o_accum_shape, DType::F32, q.device())?,
-        )
-    };
+    // Deliberately zero plan outputs and workspaces for correctness diagnostics. Planning and
+    // decode are expected to overwrite every element they subsequently read.
+    let scheduler_metadata = Tensor::zeros(
+        (meta.num_sm_parts, metadata_i32_per_part),
+        DType::I32,
+        q.device(),
+    )?;
+    let num_splits = Tensor::zeros((meta.num_splits_len,), DType::I32, q.device())?;
+    let lse_accum = Tensor::zeros(lse_accum_shape, DType::F32, q.device())?;
+    let o_accum = Tensor::zeros(o_accum_shape, DType::F32, q.device())?;
 
     {
         let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
@@ -229,17 +229,14 @@ pub fn sparse_decode(
     )?;
     validate_plan_tensors(q, dims, plan)?;
 
-    // SAFETY: Sparse decode writes every output and LSE element before returning these tensors.
-    let (out, lse_internal) = unsafe {
-        (
-            Tensor::empty(
-                (dims.batch, dims.s_q, dims.h_q, dims.d_v),
-                DType::BF16,
-                q.device(),
-            )?,
-            Tensor::empty((dims.batch, dims.s_q, dims.h_q), DType::F32, q.device())?,
-        )
-    };
+    // Deliberately zero final outputs for correctness diagnostics. Sparse decode is expected to
+    // overwrite every element before returning these tensors.
+    let out = Tensor::zeros(
+        (dims.batch, dims.s_q, dims.h_q, dims.d_v),
+        DType::BF16,
+        q.device(),
+    )?;
+    let lse_internal = Tensor::zeros((dims.batch, dims.s_q, dims.h_q), DType::F32, q.device())?;
 
     let (stream, _device_id) = stream_and_device_id(q)?;
     let q_stride = q.stride();
@@ -394,6 +391,14 @@ pub fn sparse_decode(
             &stream,
             "num_splits",
         )?;
+
+        zero_f32_workspace_async(
+            &plan.lse_accum,
+            lse_accum_ptr.as_mut_f32(),
+            &stream,
+            "lse_accum",
+        )?;
+        zero_f32_workspace_async(&plan.o_accum, o_accum_ptr.as_mut_f32(), &stream, "o_accum")?;
 
         let params = SparseDecodeLaunchParams {
             dims,
@@ -684,6 +689,36 @@ fn validate_plan_tensors(
         return invalid_arg("o_accum shape does not match sparse decode plan metadata");
     }
     Ok(())
+}
+
+/// Clears a contiguous CUDA F32 workspace in place on `stream`.
+///
+/// `tensor` supplies the element count for `ptr` and must be a contiguous CUDA F32 tensor whose
+/// storage starts at `ptr`. The clear is stream ordered and does not synchronize the device.
+fn zero_f32_workspace_async(
+    tensor: &Tensor,
+    ptr: *mut f32,
+    stream: &Arc<CudaStream>,
+    name: &str,
+) -> Result<()> {
+    if tensor.dtype() != DType::F32 {
+        return invalid_arg(format!(
+            "{name} must have dtype F32 before zeroing, got {:?}",
+            tensor.dtype()
+        ));
+    }
+    if !tensor.is_contiguous() {
+        return invalid_arg(format!("{name} must be contiguous before zeroing"));
+    }
+    let num_bytes = tensor
+        .elem_count()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| crate::Error::Tensor(format!("{name} byte count overflow")))?;
+
+    // SAFETY: `ptr` was extracted from `tensor` on `stream`, the tensor is contiguous F32, and
+    // `num_bytes` is its checked allocation view size. All-zero bits represent valid F32 zeroes.
+    unsafe { memset_d8_async(ptr as usize as u64, 0, num_bytes, stream.cu_stream()) }
+        .map_err(|error| crate::Error::Tensor(format!("failed to zero {name}: {error}")))
 }
 
 fn decode_workspace_shapes(
@@ -999,8 +1034,8 @@ mod tests {
         // Modeld captures intermediate allocations, copies its final output into stable memory,
         // and records frees before graph instantiation. Mirror that lifecycle here so replay is
         // tested rather than retaining a graph allocation outside the capture region.
-        let stable_out = unsafe { Tensor::empty((1, 1, 128, 512), DType::BF16, &device)? };
-        let stable_lse = unsafe { Tensor::empty((1, 128, 1), DType::F32, &device)? };
+        let stable_out = Tensor::zeros((1, 1, 128, 512), DType::BF16, &device)?;
+        let stable_lse = Tensor::zeros((1, 128, 1), DType::F32, &device)?;
         let stream = cuda_device.cuda_stream();
         stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
