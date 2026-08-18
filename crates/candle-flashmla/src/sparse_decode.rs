@@ -4,7 +4,7 @@ pub use flashmla::{SparseDecodeConfig, SparseDecodeDims, SparseDecodePlanMeta};
 
 use candle::{DType, Tensor};
 use flashmla::{
-    SparseDecodeLaunchParams, SparseDecodePlanParams, SparseDecodeStrides, get_device_info,
+    Arch, SparseDecodeLaunchParams, SparseDecodePlanParams, SparseDecodeStrides, get_device_info,
     sparse_decode_bf16_fp8, sparse_decode_plan as flashmla_sparse_decode_plan,
 };
 
@@ -65,8 +65,10 @@ pub fn sparse_decode_plan(
     )?;
     let (stream, device_id) = stream_and_device_id(q)?;
     let device = get_device_info(device_id)?;
+    validate_kv_block_strides_for_arch(dims, kv_cache, extra_kv_cache, device.arch)?;
     let num_sm = usize::try_from(device.num_sms)
         .map_err(|_| crate::Error::Tensor("num_sms overflow".to_string()))?;
+    let expected_meta = dims.plan_for_arch(device.arch, num_sm)?;
 
     let meta = {
         let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
@@ -106,6 +108,11 @@ pub fn sparse_decode_plan(
         };
         unsafe { flashmla_sparse_decode_plan(&plan_params)? }
     };
+    if meta != expected_meta {
+        return invalid_arg(
+            "sparse decode FFI planning disagrees with architecture-specific workspace sizing",
+        );
+    }
 
     if meta.num_sm_parts == 0 || meta.scheduler_metadata_i32_len % meta.num_sm_parts != 0 {
         return invalid_arg("invalid sparse decode scheduler metadata shape");
@@ -113,16 +120,21 @@ pub fn sparse_decode_plan(
     let metadata_i32_per_part = meta.scheduler_metadata_i32_len / meta.num_sm_parts;
     let (lse_accum_shape, o_accum_shape) = decode_workspace_shapes(meta, dims)?;
 
-    let scheduler_metadata = Tensor::zeros(
-        (meta.num_sm_parts, metadata_i32_per_part),
-        DType::I32,
-        q.device(),
-    )?;
-    // SAFETY: The second FlashMLA planning call writes every split-offset element before
-    // the plan is returned or used by decode.
-    let num_splits = unsafe { Tensor::empty((meta.num_splits_len,), DType::I32, q.device())? };
-    let lse_accum = Tensor::zeros(lse_accum_shape, DType::F32, q.device())?;
-    let o_accum = Tensor::zeros(o_accum_shape, DType::F32, q.device())?;
+    // SAFETY: The second planning call writes all scheduler metadata and split offsets. Decode
+    // writes every accumulator element that combine can read; scalar no-split accumulators are
+    // required to be non-null but are never accessed.
+    let (scheduler_metadata, num_splits, lse_accum, o_accum) = unsafe {
+        (
+            Tensor::empty(
+                (meta.num_sm_parts, metadata_i32_per_part),
+                DType::I32,
+                q.device(),
+            )?,
+            Tensor::empty((meta.num_splits_len,), DType::I32, q.device())?,
+            Tensor::empty(lse_accum_shape, DType::F32, q.device())?,
+            Tensor::empty(o_accum_shape, DType::F32, q.device())?,
+        )
+    };
 
     {
         let topk_length_storage_and_layout = topk_length.map(Tensor::storage_and_layout);
@@ -523,6 +535,33 @@ fn validate_decode_tensors(
     Ok(dims)
 }
 
+fn validate_kv_block_strides_for_arch(
+    dims: SparseDecodeDims,
+    kv_cache: &Tensor,
+    extra_kv_cache: Option<&Tensor>,
+    arch: Arch,
+) -> Result<()> {
+    if arch != Arch::Sm100f {
+        return Ok(());
+    }
+    let required = if dims.d_qk == 576 { 656 } else { 576 };
+    if kv_cache.stride()[0] % required != 0 {
+        return invalid_arg(format!(
+            "SM100 kv_cache block stride must be a multiple of {required}, got {}; pad each cache block as needed",
+            kv_cache.stride()[0]
+        ));
+    }
+    if let Some(extra_kv_cache) = extra_kv_cache
+        && extra_kv_cache.stride()[0] % required != 0
+    {
+        return invalid_arg(format!(
+            "SM100 extra_kv_cache block stride must be a multiple of {required}, got {}; pad each cache block as needed",
+            extra_kv_cache.stride()[0]
+        ));
+    }
+    Ok(())
+}
+
 fn validate_extra_tensors(
     q: &Tensor,
     kv_cache: &Tensor,
@@ -686,6 +725,7 @@ fn ensure_kv_cache_dtype(t: &Tensor, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use candle::{DType, Device, Tensor};
+    use half::bf16;
 
     use super::*;
 
@@ -722,6 +762,73 @@ mod tests {
         }
     }
 
+    fn v32_unit_value_cache(page_block_size: usize) -> Vec<u8> {
+        const BYTES_PER_TOKEN: usize = 656;
+        let mut cache = vec![0_u8; page_block_size * BYTES_PER_TOKEN];
+        for row in cache.chunks_exact_mut(BYTES_PER_TOKEN) {
+            row[..512].fill(0x38); // FP8 E4M3 encoding of 1.0.
+            for scale in row[512..528].chunks_exact_mut(4) {
+                scale.copy_from_slice(&1.0_f32.to_ne_bytes());
+            }
+            // The final 128 bytes are the 64 BF16 RoPE dimensions and remain zero.
+        }
+        cache
+    }
+
+    fn model1_unit_value_cache(page_block_size: usize) -> Vec<u8> {
+        const MAIN_BYTES_PER_TOKEN: usize = 576;
+        const BYTES_PER_TOKEN: usize = 584;
+        let mut cache = vec![0_u8; page_block_size * BYTES_PER_TOKEN];
+        for token in 0..page_block_size {
+            let main_start = token * MAIN_BYTES_PER_TOKEN;
+            cache[main_start..main_start + 448].fill(0x38); // FP8 E4M3 1.0.
+        }
+        let scales_start = page_block_size * MAIN_BYTES_PER_TOKEN;
+        for token in 0..page_block_size {
+            let token_scales = scales_start + token * 8;
+            cache[token_scales..token_scales + 7].fill(0x7f); // FP8 E8M0 1.0.
+        }
+        cache
+    }
+
+    fn assert_unit_decode_output(output: &SparseDecodeOutput) -> Result<()> {
+        let values = output.out.flatten_all()?.to_vec1::<bf16>()?;
+        assert!(values.iter().all(|value| f32::from(*value).is_finite()));
+        assert!(
+            values
+                .iter()
+                .all(|value| (f32::from(*value) - 1.0).abs() <= 0.03)
+        );
+        let lse = output.lse.flatten_all()?.to_vec1::<f32>()?;
+        let expected_lse = (64.0_f32).ln();
+        assert!(lse.iter().all(|value| value.is_finite()));
+        assert!(lse.iter().all(|value| (value - expected_lse).abs() <= 0.03));
+        Ok(())
+    }
+
+    fn assert_model1_decode_output(output: &SparseDecodeOutput) -> Result<()> {
+        let values = output.out.flatten_all()?.to_vec1::<bf16>()?;
+        for value_head in values.chunks_exact(512) {
+            assert!(
+                value_head[..448]
+                    .iter()
+                    .all(|value| (f32::from(*value) - 1.0).abs() <= 0.03)
+            );
+            assert!(
+                value_head[448..]
+                    .iter()
+                    .all(|value| f32::from(*value).abs() <= 0.03)
+            );
+        }
+        let lse = output.lse.flatten_all()?.to_vec1::<f32>()?;
+        let expected_lse = (64.0_f32).ln();
+        assert!(
+            lse.iter()
+                .all(|value| value.is_finite() && (value - expected_lse).abs() <= 0.03)
+        );
+        Ok(())
+    }
+
     #[test]
     fn no_split_decode_uses_scalar_workspaces() -> Result<()> {
         let shapes = decode_workspace_shapes(test_plan_meta(1, 1, 1), test_decode_dims())?;
@@ -743,6 +850,21 @@ mod tests {
                 (total_splits, dims.s_q, dims.h_q, dims.d_v)
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sm100_model1_requires_tma_aligned_cache_blocks() -> Result<()> {
+        let dims = SparseDecodeDims {
+            h_q: 128,
+            d_qk: 512,
+            ..test_decode_dims()
+        };
+        let contiguous = Tensor::zeros((1, 64, 1, 584), DType::U8, &Device::Cpu)?;
+        assert!(validate_kv_block_strides_for_arch(dims, &contiguous, None, Arch::Sm100f).is_err());
+
+        let padded = Tensor::zeros((1, 72, 1, 584), DType::U8, &Device::Cpu)?.narrow(1, 0, 64)?;
+        validate_kv_block_strides_for_arch(dims, &padded, None, Arch::Sm100f)?;
         Ok(())
     }
 
@@ -838,6 +960,169 @@ mod tests {
         assert_eq!(output.out.dims4()?, (1, 1024, 64, 512));
         assert_eq!(output.lse.dims3()?, (1, 64, 1024));
         device.synchronize()?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a visible SM100 CUDA GPU"]
+    fn sparse_decode_sm100_smoke() -> Result<()> {
+        use candle::cuda_backend::cudarc::driver::sys::{
+            CUgraphInstantiate_flags, CUstreamCaptureMode,
+        };
+
+        let device = Device::new_cuda_with_stream(0)?;
+        let cuda_device = device.as_cuda_device()?;
+        // SAFETY: This smoke test uses one non-default stream and manages ordering explicitly,
+        // matching modeld's CUDA graph setup.
+        unsafe { cuda_device.disable_event_tracking() };
+        let info = get_device_info(0)?;
+        assert_eq!(info.arch, flashmla::Arch::Sm100f);
+
+        let q = Tensor::from_vec(vec![bf16::ZERO; 128 * 576], (1, 1, 128, 576), &device)?;
+        let kv_cache = Tensor::from_vec(v32_unit_value_cache(64), (1, 64, 1, 656), &device)?;
+        let indices = Tensor::from_vec((0_i32..64_i32).collect(), (1, 1, 64), &device)?;
+        let config = SparseDecodeConfig {
+            softmax_scale: 1.0,
+            d_v: 512,
+            pad_heads: false,
+        };
+        let mut plan = sparse_decode_plan(&q, &kv_cache, &indices, None, None, None, None, config)?;
+        assert_eq!(plan.meta.fixed_overhead_num_blocks, 5);
+
+        let warmup = sparse_decode(
+            &q, &kv_cache, &indices, None, None, None, None, None, &mut plan, config,
+        )?;
+        device.synchronize()?;
+        assert_unit_decode_output(&warmup)?;
+
+        // Modeld captures intermediate allocations, copies its final output into stable memory,
+        // and records frees before graph instantiation. Mirror that lifecycle here so replay is
+        // tested rather than retaining a graph allocation outside the capture region.
+        let stable_out = unsafe { Tensor::empty((1, 1, 128, 512), DType::BF16, &device)? };
+        let stable_lse = unsafe { Tensor::empty((1, 128, 1), DType::F32, &device)? };
+        let stream = cuda_device.cuda_stream();
+        stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .map_err(|error| {
+                crate::Error::Tensor(format!("failed to begin CUDA graph capture: {error}"))
+            })?;
+        let captured_output = sparse_decode(
+            &q, &kv_cache, &indices, None, None, None, None, None, &mut plan, config,
+        )?;
+        {
+            use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_async;
+
+            let (captured_out_storage, captured_out_layout) =
+                captured_output.out.storage_and_layout();
+            let (stable_out_storage, stable_out_layout) = stable_out.storage_and_layout();
+            let captured_out_ptr = tensor_ptr_bf16(
+                &captured_out_storage,
+                captured_out_layout.start_offset(),
+                &stream,
+                "captured_out",
+            )?;
+            let stable_out_ptr = tensor_ptr_bf16(
+                &stable_out_storage,
+                stable_out_layout.start_offset(),
+                &stream,
+                "stable_out",
+            )?;
+
+            let (captured_lse_storage, captured_lse_layout) =
+                captured_output.lse.storage_and_layout();
+            let (stable_lse_storage, stable_lse_layout) = stable_lse.storage_and_layout();
+            let captured_lse_ptr = tensor_ptr_f32(
+                &captured_lse_storage,
+                captured_lse_layout.start_offset(),
+                &stream,
+                "captured_lse",
+            )?;
+            let stable_lse_ptr = tensor_ptr_f32(
+                &stable_lse_storage,
+                stable_lse_layout.start_offset(),
+                &stream,
+                "stable_lse",
+            )?;
+
+            // SAFETY: All four pointers are allocations on `stream`; destinations are large
+            // enough for the exact captured output byte counts and remain live through replay.
+            unsafe {
+                memcpy_dtod_async(
+                    stable_out_ptr.as_mut_void() as usize as u64,
+                    captured_out_ptr.as_const_void() as usize as u64,
+                    128 * 512 * std::mem::size_of::<bf16>(),
+                    stream.cu_stream(),
+                )
+                .map_err(|error| {
+                    crate::Error::Tensor(format!("failed to capture output copy: {error}"))
+                })?;
+                memcpy_dtod_async(
+                    stable_lse_ptr.as_mut_f32() as usize as u64,
+                    captured_lse_ptr.as_const_f32() as usize as u64,
+                    128 * std::mem::size_of::<f32>(),
+                    stream.cu_stream(),
+                )
+                .map_err(|error| {
+                    crate::Error::Tensor(format!("failed to capture LSE copy: {error}"))
+                })?;
+            }
+        }
+        drop(captured_output);
+        let graph = stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|error| {
+                crate::Error::Tensor(format!("failed to end CUDA graph capture: {error}"))
+            })?
+            .ok_or_else(|| crate::Error::Tensor("CUDA graph capture was empty".to_string()))?;
+        graph.launch().map_err(|error| {
+            crate::Error::Tensor(format!("failed to replay CUDA graph: {error}"))
+        })?;
+        device.synchronize()?;
+        let stable_output = SparseDecodeOutput {
+            out: stable_out,
+            lse: stable_lse,
+        };
+        assert_unit_decode_output(&stable_output)?;
+        graph.launch().map_err(|error| {
+            crate::Error::Tensor(format!(
+                "failed to replay CUDA graph a second time: {error}"
+            ))
+        })?;
+        device.synchronize()?;
+        assert_unit_decode_output(&stable_output)?;
+
+        let model1_q = Tensor::from_vec(vec![bf16::ZERO; 128 * 512], (1, 1, 128, 512), &device)?;
+        let mut model1_cache_data = model1_unit_value_cache(64);
+        model1_cache_data.resize(72 * 584, 0);
+        let model1_kv_cache =
+            Tensor::from_vec(model1_cache_data, (1, 72, 1, 584), &device)?.narrow(1, 0, 64)?;
+        assert_eq!(model1_kv_cache.stride()[0] % 576, 0);
+        let mut model1_plan = sparse_decode_plan(
+            &model1_q,
+            &model1_kv_cache,
+            &indices,
+            None,
+            None,
+            None,
+            None,
+            config,
+        )?;
+        assert_eq!(model1_plan.meta.fixed_overhead_num_blocks, 3);
+        let model1_output = sparse_decode(
+            &model1_q,
+            &model1_kv_cache,
+            &indices,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut model1_plan,
+            config,
+        )?;
+        device.synchronize()?;
+        assert_model1_decode_output(&model1_output)?;
 
         Ok(())
     }

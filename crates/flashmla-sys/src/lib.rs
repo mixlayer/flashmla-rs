@@ -213,7 +213,8 @@ pub struct flashmla_sparse_decode_params_t {
     pub stride_q_s_q: c_int,
     /// Element stride between query heads.
     pub stride_q_h_q: c_int,
-    /// Byte stride between KV cache pages.
+    /// Byte stride between KV cache pages. SM100 requires a multiple of 656 for V32 or 576 for
+    /// MODEL1.
     pub stride_kv_block: c_int,
     /// Byte stride between KV cache rows.
     pub stride_kv_row: c_int,
@@ -231,7 +232,7 @@ pub struct flashmla_sparse_decode_params_t {
     pub stride_o_s_q: c_int,
     /// Element stride between output heads.
     pub stride_o_h_q: c_int,
-    /// Byte stride between extra KV cache pages.
+    /// Byte stride between extra KV cache pages, with the same SM100 alignment as the main cache.
     pub stride_extra_kv_block: c_int,
     /// Byte stride between extra KV cache rows.
     pub stride_extra_kv_row: c_int,
@@ -279,7 +280,7 @@ unsafe extern "C" {
         num_sms: *mut c_int,
     ) -> flashmla_status_t;
 
-    /// Launches the SM90 BF16 sparse prefill kernel.
+    /// Launches the compiled SM90 or SM100 BF16 sparse prefill kernel.
     ///
     /// The caller owns all input, output, and stream lifetimes. On success the launch is enqueued
     /// on `params.stream`; this function does not synchronize the stream.
@@ -297,7 +298,7 @@ unsafe extern "C" {
         result: *mut flashmla_sparse_decode_plan_result_t,
     ) -> flashmla_status_t;
 
-    /// Launches SM90 sparse BF16-query / FP8-cache decode followed by BF16 combine.
+    /// Launches compiled SM90 or SM100 sparse BF16-query / FP8-cache decode and BF16 combine.
     ///
     /// The caller owns all input, output, workspace, metadata, and stream lifetimes. On success
     /// the launches are enqueued on `params.stream`; this function does not synchronize.

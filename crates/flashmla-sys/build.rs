@@ -6,9 +6,12 @@ use std::{
     process::Command,
 };
 
-const UPSTREAM_SM90_SOURCES: &[&str] = &[
+const COMMON_DECODE_SOURCES: &[&str] = &[
     "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/smxx/decode/combine/combine.cu",
+];
+
+const SM90_SOURCES: &[&str] = &[
     "csrc/sm90/prefill/sparse/fwd.cu",
     "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
     "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
@@ -18,6 +21,17 @@ const UPSTREAM_SM90_SOURCES: &[&str] = &[
     "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
     "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
     "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+];
+
+const SM100_SOURCES: &[&str] = &[
+    "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
+    "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
+    "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+    "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+    "csrc/sm100/decode/head64/instantiations/v32.cu",
+    "csrc/sm100/decode/head64/instantiations/model1.cu",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
 ];
 
 fn main() {
@@ -59,7 +73,7 @@ fn main() {
     let nvcc = cuda_root.join("bin").join("nvcc");
     let ar = find_program("ar").unwrap_or_else(|| PathBuf::from("ar"));
 
-    for source in UPSTREAM_SM90_SOURCES {
+    for source in COMMON_DECODE_SOURCES.iter().chain(arch.sources()) {
         println!(
             "cargo:rerun-if-changed={}",
             flashmla_root.join(source).display()
@@ -71,7 +85,7 @@ fn main() {
     );
     println!("cargo:metadata=source_root={}", flashmla_root.display());
 
-    let sources = selected_sources(&manifest_dir, &flashmla_root);
+    let sources = selected_sources(&manifest_dir, &flashmla_root, arch);
     for source in &sources {
         require_file(source);
     }
@@ -84,7 +98,7 @@ fn main() {
         )
     });
 
-    let include_dirs = include_dirs(&manifest_dir, &flashmla_root, &cuda_root);
+    let include_dirs = include_dirs(&manifest_dir, &flashmla_root, &cuda_root, &arch);
     let mut objects = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
         let object = build_dir.join(format!("{index:02}_{}.o", object_stem(source)));
@@ -211,7 +225,7 @@ fn selected_arch() -> Result<Arch, String> {
             .collect();
         if parsed.len() != 1 {
             panic!(
-                "FLASHMLA_ARCHS={archs:?} is not supported yet. Phase 2 only supports a single sm90a build."
+                "FLASHMLA_ARCHS={archs:?} is not supported yet. Use exactly one of sm90a or sm100f."
             );
         }
         return parse_arch(parsed[0], "FLASHMLA_ARCHS");
@@ -220,8 +234,70 @@ fn selected_arch() -> Result<Arch, String> {
     match env::var("CUDA_COMPUTE_CAP") {
         Ok(value) if !value.trim().is_empty() => parse_arch(value.trim(), "CUDA_COMPUTE_CAP"),
         Ok(_) => panic!("CUDA_COMPUTE_CAP is set but empty"),
-        Err(_) => Ok(Arch::Sm90a),
+        Err(env::VarError::NotPresent) => detect_arch_with_nvidia_smi(),
+        Err(env::VarError::NotUnicode(_)) => panic!("CUDA_COMPUTE_CAP is not valid Unicode"),
     }
+}
+
+fn detect_arch_with_nvidia_smi() -> Result<Arch, String> {
+    let Some(nvidia_smi) = find_program("nvidia-smi") else {
+        return Err(
+            "CUDA architecture auto-detection requires `nvidia-smi`, but it was not found in PATH. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly"
+                .to_string(),
+        );
+    };
+    let output = Command::new(&nvidia_smi)
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run {} for CUDA architecture auto-detection: {error}. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly",
+                nvidia_smi.display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} failed during CUDA architecture auto-detection with status {}: {}. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly",
+            nvidia_smi.display(),
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|error| {
+        format!(
+            "{} returned non-UTF-8 compute capability output: {error}. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly",
+            nvidia_smi.display()
+        )
+    })?;
+    parse_detected_archs(&stdout)
+}
+
+fn parse_detected_archs(output: &str) -> Result<Arch, String> {
+    let mut capabilities = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(first_capability) = capabilities.next() else {
+        return Err(
+            "nvidia-smi reported no visible GPUs during CUDA architecture auto-detection. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly"
+                .to_string(),
+        );
+    };
+    let selected = parse_arch(first_capability, "nvidia-smi compute capability")?;
+    for capability in capabilities {
+        let arch = parse_arch(capability, "nvidia-smi compute capability")?;
+        if arch != selected {
+            return Err(format!(
+                "nvidia-smi reported mixed GPU architectures ({first_capability} and {capability}), but flashmla-rs builds exactly one architecture. Set CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f explicitly"
+            ));
+        }
+    }
+    println!(
+        "cargo:warning=auto-detected FlashMLA target {} from nvidia-smi",
+        selected.name()
+    );
+    Ok(selected)
 }
 
 fn parse_arch(value: &str, source: &str) -> Result<Arch, String> {
@@ -234,35 +310,39 @@ fn parse_arch(value: &str, source: &str) -> Result<Arch, String> {
 
     match normalized.as_str() {
         "90" | "90a" | "sm90" | "sm90a" | "compute90a" => Ok(Arch::Sm90a),
-        "100" | "100f" | "sm100" | "sm100f" | "compute100f" => Err(format!(
-            "{source}={value:?} requested SM100, but bindings are not implemented by this crate yet"
-        )),
+        "100" | "100f" | "sm100" | "sm100f" | "compute100f" => Ok(Arch::Sm100f),
         "120" | "121" | "sm120" | "sm121" => Err(format!(
             "{source}={value:?} is unsupported by upstream FlashMLA sparse MLA"
         )),
         _ => Err(format!(
-            "{source}={value:?} is unsupported. Use CUDA_COMPUTE_CAP=90 or FLASHMLA_ARCHS=sm90a"
+            "{source}={value:?} is unsupported. Use CUDA_COMPUTE_CAP=90/100 or FLASHMLA_ARCHS=sm90a/sm100f"
         )),
     }
 }
 
-fn selected_sources(manifest_dir: &Path, flashmla_root: &Path) -> Vec<PathBuf> {
-    let mut sources = Vec::with_capacity(UPSTREAM_SM90_SOURCES.len() + 1);
+fn selected_sources(manifest_dir: &Path, flashmla_root: &Path, arch: Arch) -> Vec<PathBuf> {
+    let mut sources = Vec::with_capacity(COMMON_DECODE_SOURCES.len() + arch.sources().len() + 1);
     sources.push(manifest_dir.join("csrc").join("flashmla_c_api.cu"));
     sources.extend(
-        UPSTREAM_SM90_SOURCES
+        COMMON_DECODE_SOURCES
             .iter()
+            .chain(arch.sources())
             .map(|source| flashmla_root.join(source)),
     );
     sources
 }
 
-fn include_dirs(manifest_dir: &Path, flashmla_root: &Path, cuda_root: &Path) -> Vec<PathBuf> {
+fn include_dirs(
+    manifest_dir: &Path,
+    flashmla_root: &Path,
+    cuda_root: &Path,
+    arch: &Arch,
+) -> Vec<PathBuf> {
     vec![
         manifest_dir.join("csrc"),
         flashmla_root.join("csrc"),
         flashmla_root.join("csrc").join("kerutils").join("include"),
-        flashmla_root.join("csrc").join("sm90"),
+        flashmla_root.join("csrc").join(arch.source_dir()),
         flashmla_root.join("csrc").join("cutlass").join("include"),
         flashmla_root
             .join("csrc")
@@ -311,6 +391,7 @@ fn compile_cuda_source(
         "-Xcompiler=-fvisibility=hidden",
     ]);
     command.arg("-gencode").arg(arch.gencode());
+    command.arg(arch.target_define());
     if env_truthy("FLASHMLA_PTXAS_VERBOSE") {
         command.arg("--ptxas-options=-v");
     }
@@ -418,21 +499,72 @@ fn is_truthy(value: OsString) -> bool {
     )
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Arch {
     Sm90a,
+    Sm100f,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arch, parse_detected_archs};
+
+    #[test]
+    fn detects_homogeneous_sm100_gpus() {
+        assert_eq!(parse_detected_archs("10.0\n10.0\n").unwrap(), Arch::Sm100f);
+    }
+
+    #[test]
+    fn detects_homogeneous_sm90_gpus() {
+        assert_eq!(parse_detected_archs("9.0\n9.0\n").unwrap(), Arch::Sm90a);
+    }
+
+    #[test]
+    fn rejects_mixed_gpu_architectures() {
+        let error = parse_detected_archs("9.0\n10.0\n").unwrap_err();
+        assert!(error.contains("mixed GPU architectures"));
+    }
+
+    #[test]
+    fn rejects_empty_gpu_query() {
+        let error = parse_detected_archs("\n").unwrap_err();
+        assert!(error.contains("no visible GPUs"));
+    }
 }
 
 impl Arch {
     fn name(self) -> &'static str {
         match self {
             Self::Sm90a => "sm90a",
+            Self::Sm100f => "sm100f",
+        }
+    }
+
+    fn source_dir(self) -> &'static str {
+        match self {
+            Self::Sm90a => "sm90",
+            Self::Sm100f => "sm100",
+        }
+    }
+
+    fn sources(self) -> &'static [&'static str] {
+        match self {
+            Self::Sm90a => SM90_SOURCES,
+            Self::Sm100f => SM100_SOURCES,
         }
     }
 
     fn gencode(self) -> &'static str {
         match self {
             Self::Sm90a => "arch=compute_90a,code=sm_90a",
+            Self::Sm100f => "arch=compute_100f,code=sm_100f",
+        }
+    }
+
+    fn target_define(self) -> &'static str {
+        match self {
+            Self::Sm90a => "-DFLASHMLA_TARGET_SM90=1",
+            Self::Sm100f => "-DFLASHMLA_TARGET_SM100=1",
         }
     }
 }

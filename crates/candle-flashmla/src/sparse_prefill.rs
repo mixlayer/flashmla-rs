@@ -92,7 +92,9 @@ pub fn sparse_prefill(
         d_v: config.d_v,
         topk,
     };
-    dims.validate()?;
+    let (stream, device_id) = stream_and_device_id(q)?;
+    let device = get_device_info(device_id)?;
+    dims.validate_for_arch(device.arch)?;
 
     // SAFETY: The FlashMLA prefill kernel fully overwrites `out`, `max_logits`, and `lse`
     // for every query/head element before these tensors are returned.
@@ -104,8 +106,6 @@ pub fn sparse_prefill(
         )
     };
 
-    let (stream, device_id) = stream_and_device_id(q)?;
-    let device = get_device_info(device_id)?;
     let q_stride = q.stride();
     let kv_stride = kv.stride();
     let indices_stride = indices.stride();
@@ -196,6 +196,7 @@ pub fn sparse_prefill(
 #[cfg(test)]
 mod tests {
     use candle::{DType, Device, Tensor};
+    use half::bf16;
 
     use super::*;
 
@@ -224,6 +225,58 @@ mod tests {
         assert_eq!(output.max_logits.dims2()?, (16, 64));
         assert_eq!(output.lse.dims2()?, (16, 64));
         device.synchronize()?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a visible SM100 CUDA GPU"]
+    fn sparse_prefill_sm100_smoke() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let info = get_device_info(0)?;
+        assert_eq!(info.arch, flashmla::Arch::Sm100f);
+
+        for (h_q, d_qk, topk) in [(64, 576, 64), (128, 512, 64), (128, 576, 128)] {
+            let q = Tensor::from_vec(vec![bf16::ZERO; h_q * d_qk], (1, h_q, d_qk), &device)?;
+            let kv = Tensor::from_vec(vec![bf16::ONE; topk * d_qk], (topk, 1, d_qk), &device)?;
+            let indices = Tensor::from_vec(
+                (0..i32::try_from(topk).unwrap()).collect::<Vec<_>>(),
+                (1, 1, topk),
+                &device,
+            )?;
+            let output = sparse_prefill(
+                &q,
+                &kv,
+                &indices,
+                None,
+                None,
+                SparsePrefillConfig {
+                    softmax_scale: 1.0,
+                    d_v: 512,
+                    pad_heads: false,
+                },
+            )?;
+            device.synchronize()?;
+
+            assert_eq!(output.out.dims3()?, (1, h_q, 512));
+            let values = output.out.flatten_all()?.to_vec1::<bf16>()?;
+            assert!(values.iter().all(|value| f32::from(*value).is_finite()));
+            assert!(
+                values
+                    .iter()
+                    .all(|value| (f32::from(*value) - 1.0).abs() <= 0.02)
+            );
+            let max_logits = output.max_logits.flatten_all()?.to_vec1::<f32>()?;
+            assert!(
+                max_logits
+                    .iter()
+                    .all(|value| value.is_finite() && value.abs() <= 0.02)
+            );
+            let lse = output.lse.flatten_all()?.to_vec1::<f32>()?;
+            let expected_lse = (topk as f32).ln();
+            assert!(lse.iter().all(|value| value.is_finite()));
+            assert!(lse.iter().all(|value| (value - expected_lse).abs() <= 0.02));
+        }
 
         Ok(())
     }
