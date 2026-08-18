@@ -2,7 +2,7 @@
 
 pub use flashmla::{SparseDecodeConfig, SparseDecodeDims, SparseDecodePlanMeta};
 
-use candle::{DType, Tensor};
+use candle::{DType, Device, DeviceLocation, Tensor};
 use flashmla::{
     Arch, SparseDecodeLaunchParams, SparseDecodePlanParams, SparseDecodeStrides, get_device_info,
     sparse_decode_bf16_fp8, sparse_decode_plan as flashmla_sparse_decode_plan,
@@ -32,6 +32,133 @@ pub struct SparseDecodePlan {
     pub meta: SparseDecodePlanMeta,
 }
 
+/// Shared split-KV accumulation storage for serialized sparse decode plans.
+///
+/// The backing F32 tensors are flat maximum-capacity allocations. Plans built
+/// with [`sparse_decode_plan_with_workspace`] retain offset-zero shaped views
+/// into these allocations, keeping their CUDA addresses stable for graph
+/// capture. Decode launches whose plans share a workspace must be serialized,
+/// including when they use different CUDA streams.
+#[derive(Debug)]
+pub struct SparseDecodeWorkspace {
+    lse_accum: Tensor,
+    o_accum: Tensor,
+    lse_accum_elem_capacity: usize,
+    o_accum_elem_capacity: usize,
+}
+
+impl SparseDecodeWorkspace {
+    /// Allocates shared F32 accumulation storage for sparse decode shapes up to
+    /// `[max_batch, max_query_tokens, query_heads, value_head_dim]`.
+    ///
+    /// `device` must be CUDA, `query_heads` must be the FlashMLA-padded head
+    /// count, and every dimension must be non-zero. The returned flat buffers
+    /// conservatively cover every split-KV plan with `batch <= max_batch` and
+    /// `s_q <= max_query_tokens` on the device. Their contents are
+    /// uninitialized and may only be read after a sparse decode kernel writes
+    /// the corresponding plan view.
+    pub fn new(
+        device: &Device,
+        max_batch: usize,
+        max_query_tokens: usize,
+        query_heads: usize,
+        value_head_dim: usize,
+    ) -> Result<Self> {
+        if max_batch == 0 || max_query_tokens == 0 || query_heads == 0 || value_head_dim == 0 {
+            return invalid_arg("sparse decode workspace dimensions must all be non-zero");
+        }
+        if query_heads != 64 && query_heads != 128 {
+            return invalid_arg(format!(
+                "sparse decode workspace query_heads must be padded to 64 or 128, got {query_heads}"
+            ));
+        }
+        if value_head_dim != 512 {
+            return invalid_arg(format!(
+                "sparse decode workspace value_head_dim must be 512, got {value_head_dim}"
+            ));
+        }
+        let device_id = match device.location() {
+            DeviceLocation::Cuda { gpu_id } => i32::try_from(gpu_id)
+                .map_err(|_| crate::Error::Tensor("device id overflow".to_string()))?,
+            location => {
+                return invalid_arg(format!(
+                    "sparse decode workspace requires a CUDA device, got {location:?}"
+                ));
+            }
+        };
+        let device_info = get_device_info(device_id)?;
+        let num_sm = usize::try_from(device_info.num_sms)
+            .map_err(|_| crate::Error::Tensor("num_sms overflow".to_string()))?;
+        let (lse_accum_elem_capacity, o_accum_elem_capacity) = decode_workspace_capacities(
+            max_batch,
+            max_query_tokens,
+            query_heads,
+            value_head_dim,
+            num_sm,
+        )?;
+
+        // SAFETY: Sparse decode writes every accumulator element read by its
+        // combine kernel. No-split plans require non-null scalar views but do
+        // not access their accumulator contents.
+        let (lse_accum, o_accum) = unsafe {
+            (
+                Tensor::empty((lse_accum_elem_capacity,), DType::F32, device)?,
+                Tensor::empty((o_accum_elem_capacity,), DType::F32, device)?,
+            )
+        };
+        Ok(Self {
+            lse_accum,
+            o_accum,
+            lse_accum_elem_capacity,
+            o_accum_elem_capacity,
+        })
+    }
+
+    /// Returns the number of F32 elements in the shared LSE accumulator.
+    pub fn lse_accum_elem_capacity(&self) -> usize {
+        self.lse_accum_elem_capacity
+    }
+
+    /// Returns the number of F32 elements in the shared output accumulator.
+    pub fn o_accum_elem_capacity(&self) -> usize {
+        self.o_accum_elem_capacity
+    }
+
+    fn views(
+        &self,
+        device: &Device,
+        meta: SparseDecodePlanMeta,
+        dims: SparseDecodeDims,
+    ) -> Result<(Tensor, Tensor)> {
+        if !self.lse_accum.device().same_device(device)
+            || !self.o_accum.device().same_device(device)
+        {
+            return invalid_arg("sparse decode workspace must be on the same device as q");
+        }
+        if meta.lse_accum_elem_count > self.lse_accum_elem_capacity
+            || meta.o_accum_elem_count > self.o_accum_elem_capacity
+        {
+            return invalid_arg(format!(
+                "sparse decode workspace is too small: required lse={} o={}, capacity lse={} o={}",
+                meta.lse_accum_elem_count,
+                meta.o_accum_elem_count,
+                self.lse_accum_elem_capacity,
+                self.o_accum_elem_capacity,
+            ));
+        }
+        let (lse_accum_shape, o_accum_shape) = decode_workspace_shapes(meta, dims)?;
+        let lse_accum = self
+            .lse_accum
+            .narrow(0, 0, meta.lse_accum_elem_count)?
+            .reshape(lse_accum_shape)?;
+        let o_accum = self
+            .o_accum
+            .narrow(0, 0, meta.o_accum_elem_count)?
+            .reshape(o_accum_shape)?;
+        Ok((lse_accum, o_accum))
+    }
+}
+
 /// Output tensors returned by sparse decode.
 #[derive(Debug)]
 pub struct SparseDecodeOutput {
@@ -50,6 +177,62 @@ pub fn sparse_decode_plan(
     extra_kv_cache: Option<&Tensor>,
     extra_indices: Option<&Tensor>,
     extra_topk_length: Option<&Tensor>,
+    config: SparseDecodeConfig,
+) -> Result<SparseDecodePlan> {
+    sparse_decode_plan_impl(
+        q,
+        kv_cache,
+        indices,
+        topk_length,
+        extra_kv_cache,
+        extra_indices,
+        extra_topk_length,
+        None,
+        config,
+    )
+}
+
+/// Builds sparse decode scheduler metadata using shared split-KV workspaces.
+///
+/// `q` is BF16 `[batch, s_q, padded_heads, d_qk]`; `kv_cache`, `indices`, and
+/// optional tensors have the same dtype, layout, and device constraints as
+/// [`sparse_decode_plan`]. The returned plan retains offset-zero F32 views of
+/// `workspace` shaped for this decode geometry. Plans sharing a workspace must
+/// never execute concurrently because decode kernels mutate both accumulator
+/// buffers.
+pub fn sparse_decode_plan_with_workspace(
+    q: &Tensor,
+    kv_cache: &Tensor,
+    indices: &Tensor,
+    topk_length: Option<&Tensor>,
+    extra_kv_cache: Option<&Tensor>,
+    extra_indices: Option<&Tensor>,
+    extra_topk_length: Option<&Tensor>,
+    workspace: &SparseDecodeWorkspace,
+    config: SparseDecodeConfig,
+) -> Result<SparseDecodePlan> {
+    sparse_decode_plan_impl(
+        q,
+        kv_cache,
+        indices,
+        topk_length,
+        extra_kv_cache,
+        extra_indices,
+        extra_topk_length,
+        Some(workspace),
+        config,
+    )
+}
+
+fn sparse_decode_plan_impl(
+    q: &Tensor,
+    kv_cache: &Tensor,
+    indices: &Tensor,
+    topk_length: Option<&Tensor>,
+    extra_kv_cache: Option<&Tensor>,
+    extra_indices: Option<&Tensor>,
+    extra_topk_length: Option<&Tensor>,
+    workspace: Option<&SparseDecodeWorkspace>,
     config: SparseDecodeConfig,
 ) -> Result<SparseDecodePlan> {
     let dims = validate_decode_tensors(
@@ -120,10 +303,8 @@ pub fn sparse_decode_plan(
     let metadata_i32_per_part = meta.scheduler_metadata_i32_len / meta.num_sm_parts;
     let (lse_accum_shape, o_accum_shape) = decode_workspace_shapes(meta, dims)?;
 
-    // SAFETY: The second planning call writes all scheduler metadata and split offsets. Decode
-    // writes every accumulator element that combine can read; scalar no-split accumulators are
-    // required to be non-null but are never accessed.
-    let (scheduler_metadata, num_splits, lse_accum, o_accum) = unsafe {
+    // SAFETY: The second planning call writes all scheduler metadata and split offsets.
+    let (scheduler_metadata, num_splits) = unsafe {
         (
             Tensor::empty(
                 (meta.num_sm_parts, metadata_i32_per_part),
@@ -131,9 +312,18 @@ pub fn sparse_decode_plan(
                 q.device(),
             )?,
             Tensor::empty((meta.num_splits_len,), DType::I32, q.device())?,
-            Tensor::empty(lse_accum_shape, DType::F32, q.device())?,
-            Tensor::empty(o_accum_shape, DType::F32, q.device())?,
         )
+    };
+    // SAFETY: Decode writes every accumulator element that combine can read;
+    // scalar no-split accumulators must be non-null but are never accessed.
+    let (lse_accum, o_accum) = match workspace {
+        Some(workspace) => workspace.views(q.device(), meta, dims)?,
+        None => unsafe {
+            (
+                Tensor::empty(lse_accum_shape, DType::F32, q.device())?,
+                Tensor::empty(o_accum_shape, DType::F32, q.device())?,
+            )
+        },
     };
 
     {
@@ -713,6 +903,29 @@ fn decode_workspace_shapes(
     Ok((lse_shape, o_shape))
 }
 
+fn decode_workspace_capacities(
+    max_batch: usize,
+    max_query_tokens: usize,
+    query_heads: usize,
+    value_head_dim: usize,
+    num_sm: usize,
+) -> Result<(usize, usize)> {
+    // Every supported scheduler satisfies `num_sm_parts * s_q <= num_sm`.
+    // Therefore `(batch + num_sm_parts) * s_q` is bounded by
+    // `max_batch * max_query_tokens + num_sm` for every covered shape.
+    let max_split_tokens = max_batch
+        .checked_mul(max_query_tokens)
+        .and_then(|tokens| tokens.checked_add(num_sm))
+        .ok_or_else(|| crate::Error::Tensor("sparse decode workspace capacity overflow".into()))?;
+    let lse_accum_elem_capacity = max_split_tokens
+        .checked_mul(query_heads)
+        .ok_or_else(|| crate::Error::Tensor("sparse decode LSE capacity overflow".into()))?;
+    let o_accum_elem_capacity = lse_accum_elem_capacity
+        .checked_mul(value_head_dim)
+        .ok_or_else(|| crate::Error::Tensor("sparse decode output capacity overflow".into()))?;
+    Ok((lse_accum_elem_capacity.max(1), o_accum_elem_capacity.max(1)))
+}
+
 fn ensure_kv_cache_dtype(t: &Tensor, name: &str) -> Result<()> {
     match t.dtype() {
         DType::U8 | DType::F8E4M3 => Ok(()),
@@ -866,6 +1079,41 @@ mod tests {
         let padded = Tensor::zeros((1, 72, 1, 584), DType::U8, &Device::Cpu)?.narrow(1, 0, 64)?;
         validate_kv_block_strides_for_arch(dims, &padded, None, Arch::Sm100f)?;
         Ok(())
+    }
+
+    #[test]
+    fn shared_workspace_capacity_covers_every_query_width() -> Result<()> {
+        let max_batch = 1;
+        let max_query_tokens = 64;
+        let query_heads = 64;
+        let value_head_dim = 512;
+        let num_sm = 148;
+        let (lse_capacity, o_capacity) = decode_workspace_capacities(
+            max_batch,
+            max_query_tokens,
+            query_heads,
+            value_head_dim,
+            num_sm,
+        )?;
+
+        for s_q in 1..=max_query_tokens {
+            let num_sm_parts = (num_sm / s_q).max(1);
+            if num_sm_parts == 1 {
+                assert!(lse_capacity >= 1);
+                assert!(o_capacity >= 1);
+                continue;
+            }
+            let lse_required = (max_batch + num_sm_parts) * s_q * query_heads;
+            let o_required = lse_required * value_head_dim;
+            assert!(lse_capacity >= lse_required);
+            assert!(o_capacity >= o_required);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_workspace_capacity_rejects_overflow() {
+        assert!(decode_workspace_capacities(usize::MAX, 2, 64, 512, 148).is_err());
     }
 
     #[test]

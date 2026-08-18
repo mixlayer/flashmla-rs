@@ -14,5 +14,8 @@ pub mod workspace;
 /// Candle integration error and result types.
 pub use error::{Error, Result};
 
-pub use sparse_decode::{SparseDecodeOutput, SparseDecodePlan, sparse_decode, sparse_decode_plan};
+pub use sparse_decode::{
+    SparseDecodeOutput, SparseDecodePlan, SparseDecodeWorkspace, sparse_decode, sparse_decode_plan,
+    sparse_decode_plan_with_workspace,
+};
 pub use sparse_prefill::{SparsePrefillOutput, sparse_prefill};
